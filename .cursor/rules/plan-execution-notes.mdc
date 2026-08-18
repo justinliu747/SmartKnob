@@ -1,0 +1,13 @@
+---
+description: After executing a Plan mode plan, append a short entry to notes.md
+alwaysApply: true
+---
+
+# Plan execution notes
+
+When a Plan mode plan is **executed** (the user approved it and the work from that plan was written into the repo), append one entry to [notes.md](notes.md).
+
+- Log only executed plans. Do not log plans that were only discussed, edited, or abandoned.
+- Newest first, directly under the intro lines.
+- Format: `## YYYY-MM-DD — <plan title>` plus 1–3 short bullets of what landed.
+- Keep it basic. No transcripts, no rationale dumps, no extra log files, no timestamps to the second.
