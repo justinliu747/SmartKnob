@@ -1,7 +1,6 @@
 #include <Wire.h> // Include Wire first
 #include <SimpleFOC.h>
 #include <NimBLEDevice.h>
-#include <NimBLEHIDDevice.h>
 #include "esp_system.h"
 
 // --- ESP32 Pin Definitions ---
@@ -71,7 +70,6 @@ int lastDetent = 0;
 bool detentInitialized = false;
 bool bleConnected = false;
 bool bleWasConnected = false;
-uint16_t hidConnHandle = 0xFFFF;
 int lastNotifiedMode = -1;
 int lastNotifiedDetent = -1;
 
@@ -80,16 +78,6 @@ volatile uint8_t remapPercent = 0;
 
 NimBLECharacteristic* statusChar = nullptr;
 NimBLEServer* knobServer = nullptr;
-NimBLEHIDDevice* hidDevice = nullptr;
-NimBLECharacteristic* hidInputChar = nullptr;
-
-// Minimal boot-keyboard report map (report ID 1).
-uint8_t hidReportMap[] = {
-  0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7,
-  0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08,
-  0x81, 0x01, 0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65, 0x05, 0x07, 0x19, 0x00,
-  0x29, 0x65, 0x81, 0x00, 0xC0
-};
 
 void startKnobAdvertising();
 
@@ -154,69 +142,19 @@ void applyVolumeRemap(uint8_t percent) {
   notifyStatus();
 }
 
-#define HID_KEY_F     0x09
-#define HID_KEY_M     0x10
-#define HID_KEY_SPACE 0x2C
-
-bool hidReady() {
-  return hidInputChar != nullptr && hidConnHandle != 0xFFFF;
-}
-
-void sendHidReport(uint8_t key0, uint8_t key1) {
-  uint8_t report[8] = {0, 0, key0, key1, 0, 0, 0, 0};
-  hidInputChar->setValue(report, 8);
-  hidInputChar->notify();
-}
-
-void sendHidChordFM() {
-  if (!hidReady()) {
-    Serial.println("HID: no subscriber, skip F+M");
-    return;
-  }
-  sendHidReport(HID_KEY_F, HID_KEY_M);
-  delay(40);
-  sendHidReport(0, 0);
-  Serial.println("HID: sent F+M");
-}
-
-void sendHidDoubleSpace() {
-  if (!hidReady()) {
-    Serial.println("HID: no subscriber, skip spaces");
-    return;
-  }
-  sendHidReport(HID_KEY_SPACE, 0);
-  delay(40);
-  sendHidReport(0, 0);
-  delay(80);
-  sendHidReport(HID_KEY_SPACE, 0);
-  delay(40);
-  sendHidReport(0, 0);
-  Serial.println("HID: sent two Spaces");
-}
-
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
     bleConnected = true;
     Serial.print("BLE: isConnected = true, handle ");
-    Serial.print(connInfo.getConnHandle());
-    Serial.print(", count ");
-    Serial.println(pServer->getConnectedCount());
-    if (pServer->getConnectedCount() < 2) {
-      startKnobAdvertising();
-    }
+    Serial.println(connInfo.getConnHandle());
   }
 
   void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
-    if (connInfo.getConnHandle() == hidConnHandle) {
-      hidConnHandle = 0xFFFF;
-    }
     bleConnected = pServer->getConnectedCount() > 0;
     Serial.print("BLE: disconnect handle ");
     Serial.print(connInfo.getConnHandle());
     Serial.print(", reason ");
-    Serial.print(reason);
-    Serial.print(", remaining ");
-    Serial.println(pServer->getConnectedCount());
+    Serial.println(reason);
     startKnobAdvertising();
   }
 };
@@ -231,22 +169,8 @@ class VolumeCallbacks : public NimBLECharacteristicCallbacks {
   }
 };
 
-class HidInputCallbacks : public NimBLECharacteristicCallbacks {
-  void onSubscribe(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo, uint16_t subValue) override {
-    if (subValue != 0) {
-      hidConnHandle = connInfo.getConnHandle();
-      Serial.print("BLE: HID subscribed, handle ");
-      Serial.println(hidConnHandle);
-    } else if (connInfo.getConnHandle() == hidConnHandle) {
-      hidConnHandle = 0xFFFF;
-      Serial.println("BLE: HID unsubscribed");
-    }
-  }
-};
-
 ServerCallbacks serverCallbacks;
 VolumeCallbacks volumeCallbacks;
-HidInputCallbacks hidInputCallbacks;
 
 void startKnobAdvertising() {
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
@@ -254,23 +178,16 @@ void startKnobAdvertising() {
 
   NimBLEAdvertisementData advData;
   advData.setName("SmartKnob");
-  advData.setAppearance(HID_KEYBOARD);
-  advData.addServiceUUID(NimBLEUUID((uint16_t)0x1812));
   NimBLEAdvertisementData scanData;
   scanData.addServiceUUID(SK_SERVICE_UUID);
   adv->setAdvertisementData(advData);
   adv->setScanResponseData(scanData);
-
-  if (knobServer == nullptr || knobServer->getConnectedCount() < 2) {
-    adv->start();
-  }
+  adv->start();
 }
 
 void startBle() {
   NimBLEDevice::init("SmartKnob");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-  NimBLEDevice::setSecurityIOCap(0x03); // no input/output → Just Works pairing
-  NimBLEDevice::setSecurityAuth(true, false, true); // bond, no MITM, secure conn — iPhone HID
 
   knobServer = NimBLEDevice::createServer();
   knobServer->setCallbacks(&serverCallbacks);
@@ -289,17 +206,6 @@ void startBle() {
   volumeChar->setCallbacks(&volumeCallbacks);
 
   service->start();
-
-  hidDevice = new NimBLEHIDDevice(knobServer);
-  hidDevice->setManufacturer("SmartKnob");
-  hidDevice->setPnp(0x02, 0xE502, 0x0001, 0x0110);
-  hidDevice->setHidInfo(0x00, 0x01);
-  hidDevice->setReportMap(hidReportMap, sizeof(hidReportMap));
-  hidDevice->setBatteryLevel(100);
-  hidInputChar = hidDevice->getInputReport(1);
-  hidInputChar->setCallbacks(&hidInputCallbacks);
-  hidDevice->startServices();
-
   startKnobAdvertising();
 }
 
@@ -341,7 +247,7 @@ void setup() {
   startAngle = sensor.getAngle();
 
   Serial.println("Motor ready!");
-  Serial.println("Send '1', '2', or '3' to switch profiles. Send 'b' for F+M, 's' for two Spaces.");
+  Serial.println("Send '1', '2', or '3' to switch profiles.");
 
   startBle();
   Serial.println("BLE: advertising as SmartKnob");
@@ -372,8 +278,6 @@ void loop() {
     if (inChar == '1') profile = 1;
     if (inChar == '2') profile = 2;
     if (inChar == '3') profile = 3;
-    if (inChar == 'b' || inChar == 'B') sendHidChordFM();
-    if (inChar == 's' || inChar == 'S') sendHidDoubleSpace();
   }
 
   // Reset start angle after switching profile

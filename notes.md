@@ -2,6 +2,11 @@
 
 Short log of Plan mode work that actually landed in the repo. Newest first.
 
+## 2026-08-18 — Remove BLE HID keyboard
+
+- Dropped HID advertising, pairing, and serial `b`/`s` key sends.
+- BLE is custom GATT only for the Windows volume bridge; serial is profiles `1`/`2`/`3`.
+
 ## 2026-08-17 — HID serial F+M and double-Space
 
 - HID keyboard advertising is always on from boot (no serial toggle).
