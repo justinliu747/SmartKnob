@@ -1,9 +1,12 @@
 """SmartKnob Windows bridge: BLE status + system volume, simple GUI."""
 
 import asyncio
+import smtplib
 import threading
 import time
 import tkinter as tk
+from email.message import EmailMessage
+from pathlib import Path
 from tkinter import ttk
 
 from bleak import BleakClient, BleakScanner
@@ -13,19 +16,60 @@ DEVICE_NAME = "SmartKnob"
 SERVICE_UUID = "cba1d411-0e8f-4e5c-8a21-6f3c9b01a001"
 STATUS_UUID = "cba1d411-0e8f-4e5c-8a21-6f3c9b01a002"
 VOLUME_UUID = "cba1d411-0e8f-4e5c-8a21-6f3c9b01a003"
+TRIGGER_UUID = "cba1d411-0e8f-4e5c-8a21-6f3c9b01a004"
 
 MODE_NAMES = {1: "Spring", 2: "Detent", 3: "Switch"}
+ENV_PATH = Path(__file__).resolve().parent / ".env"
+FOCUS_ON_SUBJECT = "focus trigger"
+FOCUS_OFF_SUBJECT = "focus off"
+FOCUS_BODY = "sent from smartknob"
+TRIGGER_ON = 1
+TRIGGER_OFF = 2
+ICLOUD_SMTP = "smtp.mail.icloud.com"
+ICLOUD_SMTP_PORT = 587
 
 
 def windows_volume():
     return AudioUtilities.GetSpeakers().EndpointVolume
 
 
+def load_env(path):
+    values = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return values
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def send_focus_email(subject):
+    env = load_env(ENV_PATH)
+    address = env.get("ICLOUD_EMAIL", "").strip()
+    password = env.get("ICLOUD_APP_PASSWORD", "").replace(" ", "")
+    if not address or not password:
+        raise RuntimeError("Set ICLOUD_EMAIL and ICLOUD_APP_PASSWORD in .env")
+    msg = EmailMessage()
+    msg["From"] = address
+    msg["To"] = address
+    msg["Subject"] = subject
+    msg.set_content(FOCUS_BODY)
+    with smtplib.SMTP(ICLOUD_SMTP, ICLOUD_SMTP_PORT, timeout=20) as smtp:
+        smtp.starttls()
+        smtp.login(address, password)
+        smtp.send_message(msg)
+
+
 class KnobApp:
     def __init__(self, root):
         self.root = root
         self.root.title("SmartKnob")
-        self.root.geometry("520x420")
+        self.root.geometry("520x440")
         self.root.resizable(True, True)
 
         self.connected = False
@@ -40,6 +84,7 @@ class KnobApp:
         self.detent_var = tk.StringVar(value="—")
         self.volume_var = tk.StringVar(value="—")
         self.volume_pct = tk.IntVar(value=0)
+        self.email_var = tk.StringVar(value="—")
 
         pad = {"padx": 12, "pady": 4}
         ttk.Label(root, text="Connection").grid(row=0, column=0, sticky="w", **pad)
@@ -53,13 +98,15 @@ class KnobApp:
         ttk.Progressbar(root, maximum=100, variable=self.volume_pct, length=220).grid(
             row=4, column=0, columnspan=2, padx=12, pady=12, sticky="ew"
         )
+        ttk.Label(root, text="Email").grid(row=5, column=0, sticky="w", **pad)
+        ttk.Label(root, textvariable=self.email_var).grid(row=5, column=1, sticky="w", **pad)
         ttk.Button(root, text="Reconnect", command=self.ask_reconnect).grid(
-            row=5, column=0, columnspan=2, pady=8
+            row=6, column=0, columnspan=2, pady=8
         )
-        ttk.Label(root, text="BLE devices seen").grid(row=6, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Label(root, text="BLE devices seen").grid(row=7, column=0, columnspan=2, sticky="w", **pad)
         self.scan_list = tk.Listbox(root, height=10, font=("Consolas", 9))
-        self.scan_list.grid(row=7, column=0, columnspan=2, padx=12, pady=(0, 12), sticky="nsew")
-        root.grid_rowconfigure(7, weight=1)
+        self.scan_list.grid(row=8, column=0, columnspan=2, padx=12, pady=(0, 12), sticky="nsew")
+        root.grid_rowconfigure(8, weight=1)
         root.grid_columnconfigure(1, weight=1)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -70,6 +117,9 @@ class KnobApp:
 
     def set_status(self, text):
         self.ui(lambda: self.status_var.set(text))
+
+    def set_email_status(self, text):
+        self.ui(lambda: self.email_var.set(text))
 
     def apply_status_packet(self, mode, detent, percent, num_detents, from_knob):
         def update():
@@ -119,6 +169,23 @@ class KnobApp:
         mode, detent, percent, num_detents = data[0], data[1], data[2], data[3]
         self.apply_status_packet(mode, detent, percent, num_detents, from_knob=True)
 
+    async def on_trigger(self, _sender, data):
+        kind = data[0] if data else TRIGGER_ON
+        subject = FOCUS_OFF_SUBJECT if kind == TRIGGER_OFF else FOCUS_ON_SUBJECT
+        self.set_email_status(f"Sending {subject}…")
+        threading.Thread(
+            target=self.send_focus_email_worker, args=(subject,), daemon=True
+        ).start()
+
+    def send_focus_email_worker(self, subject):
+        try:
+            send_focus_email(subject)
+            print(f"Email: sent {subject}", flush=True)
+            self.set_email_status(f"Sent: {subject}")
+        except Exception as exc:
+            print(f"Email: failed: {exc}", flush=True)
+            self.set_email_status(f"Failed: {exc}")
+
     def show_scan_results(self, lines):
         def update():
             self.scan_list.delete(0, tk.END)
@@ -163,6 +230,11 @@ class KnobApp:
                     self.connected = True
                     self.set_status("Connected")
                     await client.start_notify(STATUS_UUID, self.on_status)
+                    try:
+                        await client.start_notify(TRIGGER_UUID, self.on_trigger)
+                    except Exception as exc:
+                        print(f"Email: trigger subscribe failed: {exc}", flush=True)
+                        self.set_email_status(f"Trigger unavailable: {exc}")
                     percent = int(round(self.endpoint.GetMasterVolumeLevelScalar() * 100))
                     self.echo_percent = percent
                     await self.write_percent(percent)

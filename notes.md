@@ -2,6 +2,11 @@
 
 Short log of Plan mode work that actually landed in the repo. Newest first.
 
+## 2026-08-18 — Focus trigger email
+
+- Serial `s` notifies a GATT trigger characteristic; volume_bridge.py sends iCloud mail to yourself.
+- SMTP credentials stay in local `.env` (not git). Subject `focus trigger`, body `sent from smartknob`.
+
 ## 2026-08-18 — Remove BLE HID keyboard
 
 - Dropped HID advertising, pairing, and serial `b`/`s` key sends.

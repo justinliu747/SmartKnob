@@ -13,9 +13,10 @@
 // Standard 7-bit address for Arduino Wire library (No need to bitshift!)
 #define MT6701_ADDR 0x06
 
-#define SK_SERVICE_UUID "cba1d411-0e8f-4e5c-8a21-6f3c9b01a001"
-#define SK_STATUS_UUID  "cba1d411-0e8f-4e5c-8a21-6f3c9b01a002"
-#define SK_VOLUME_UUID  "cba1d411-0e8f-4e5c-8a21-6f3c9b01a003"
+#define SK_SERVICE_UUID  "cba1d411-0e8f-4e5c-8a21-6f3c9b01a001"
+#define SK_STATUS_UUID   "cba1d411-0e8f-4e5c-8a21-6f3c9b01a002"
+#define SK_VOLUME_UUID   "cba1d411-0e8f-4e5c-8a21-6f3c9b01a003"
+#define SK_TRIGGER_UUID  "cba1d411-0e8f-4e5c-8a21-6f3c9b01a004"
 
 // Motor and Driver
 BLDCMotor motor = BLDCMotor(7);
@@ -75,8 +76,11 @@ int lastNotifiedDetent = -1;
 
 volatile bool remapPending = false;
 volatile uint8_t remapPercent = 0;
+volatile bool triggerPending = false;
+volatile uint8_t triggerValue = 1;
 
 NimBLECharacteristic* statusChar = nullptr;
+NimBLECharacteristic* triggerChar = nullptr;
 NimBLEServer* knobServer = nullptr;
 
 void startKnobAdvertising();
@@ -142,6 +146,20 @@ void applyVolumeRemap(uint8_t percent) {
   notifyStatus();
 }
 
+void notifyFocusTrigger(uint8_t value) {
+  if (triggerChar == nullptr || !bleConnected) {
+    Serial.println("BLE: focus trigger skipped (not connected)");
+    return;
+  }
+  triggerChar->setValue(&value, 1);
+  triggerChar->notify();
+  if (value == 2) {
+    Serial.println("BLE: focus off");
+  } else {
+    Serial.println("BLE: focus trigger");
+  }
+}
+
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
     bleConnected = true;
@@ -205,6 +223,11 @@ void startBle() {
   );
   volumeChar->setCallbacks(&volumeCallbacks);
 
+  triggerChar = service->createCharacteristic(
+    SK_TRIGGER_UUID,
+    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+  );
+
   service->start();
   startKnobAdvertising();
 }
@@ -247,7 +270,7 @@ void setup() {
   startAngle = sensor.getAngle();
 
   Serial.println("Motor ready!");
-  Serial.println("Send '1', '2', or '3' to switch profiles.");
+  Serial.println("Send '1', '2', or '3' to switch profiles. Send 's' for focus trigger, 'f' for focus off.");
 
   startBle();
   Serial.println("BLE: advertising as SmartKnob");
@@ -265,6 +288,11 @@ void loop() {
     applyVolumeRemap(remapPercent);
   }
 
+  if (triggerPending) {
+    triggerPending = false;
+    notifyFocusTrigger(triggerValue);
+  }
+
   if (bleConnected != bleWasConnected) {
     bleWasConnected = bleConnected;
     if (bleConnected) {
@@ -278,6 +306,14 @@ void loop() {
     if (inChar == '1') profile = 1;
     if (inChar == '2') profile = 2;
     if (inChar == '3') profile = 3;
+    if (inChar == 's' || inChar == 'S') {
+      triggerValue = 1;
+      triggerPending = true;
+    }
+    if (inChar == 'f' || inChar == 'F') {
+      triggerValue = 2;
+      triggerPending = true;
+    }
   }
 
   // Reset start angle after switching profile
