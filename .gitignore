@@ -6,6 +6,10 @@ venv/
 .env
 .env.*
 
+# Local notes and Cursor rules
+notes.md
+.cursor/
+
 # OS / editor
 .DS_Store
 Thumbs.db

@@ -1,5 +1,6 @@
 #include <Wire.h> // Include Wire first
 #include <SimpleFOC.h>
+#include <TFT_eSPI.h>
 #include <NimBLEDevice.h>
 #include "esp_system.h"
 
@@ -21,33 +22,7 @@
 // Motor and Driver
 BLDCMotor motor = BLDCMotor(7);
 BLDCDriver3PWM driver = BLDCDriver3PWM(IN1, IN2, IN3);
-
-// --- Custom MT6701 I2C Implementation for ESP32 ---
-void encoderI2CInit() {
-  Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(400000); // 400kHz fast mode
-}
-
-float encoderGetAngle() {
-  // Tell encoder we want to read starting from register 0x03
-  Wire.beginTransmission(MT6701_ADDR);
-  Wire.write(0x03);
-  Wire.endTransmission(false); // 'false' sends a restart message to keep the connection active
-
-  // Request 2 bytes (0x03 and 0x04)
-  Wire.requestFrom(MT6701_ADDR, 2);
-
-  if (Wire.available() >= 2) {
-    uint8_t upper = Wire.read(); // bits [13:6]
-    uint8_t lower = Wire.read(); // bits [5:0] in top 6 bits
-    
-    // Combine into 14-bit value just like your STM32 code
-    uint16_t rawData = ((uint16_t)upper << 6) | (lower >> 2);
-    return ((float)rawData / 16384.0f) * 2.0f * PI; 
-  }
-  
-  return 0.0f; // Fallback if I2C fails
-}
+TFT_eSPI tft = TFT_eSPI();
 
 // Re-link your custom sensor
 GenericSensor sensor = GenericSensor(encoderGetAngle, encoderI2CInit);
@@ -83,8 +58,6 @@ NimBLECharacteristic* statusChar = nullptr;
 NimBLECharacteristic* triggerChar = nullptr;
 NimBLEServer* knobServer = nullptr;
 
-void startKnobAdvertising();
-
 const char* resetReasonText(esp_reset_reason_t reason) {
   switch (reason) {
     case ESP_RST_POWERON:  return "POWERON";
@@ -99,139 +72,6 @@ const char* resetReasonText(esp_reset_reason_t reason) {
   }
 }
 
-int detentLevel() {
-  int level = (int)round(currentAngle / detentSize);
-  if (level < 0) level = 0;
-  if (level > numDetents) level = numDetents;
-  return level;
-}
-
-uint8_t percentFromLevel(int level) {
-  return (uint8_t)((level * 100) / numDetents);
-}
-
-void notifyStatus() {
-  if (statusChar == nullptr || !bleConnected) {
-    return;
-  }
-  int level = detentLevel();
-  uint8_t packet[4];
-  packet[0] = (uint8_t)profile;
-  packet[1] = (uint8_t)level;
-  packet[2] = percentFromLevel(level);
-  packet[3] = (uint8_t)numDetents;
-  statusChar->setValue(packet, 4);
-  statusChar->notify();
-  lastNotifiedMode = profile;
-  lastNotifiedDetent = level;
-}
-
-void applyVolumeRemap(uint8_t percent) {
-  if (percent > 100) {
-    percent = 100;
-  }
-  float targetAngle = (percent / 100.0f) * 2.0f * PI;
-  // currentAngle = -(sensor.getAngle() - startAngle) = startAngle - sensor.getAngle()
-  startAngle = sensor.getAngle() + targetAngle;
-  currentAngle = targetAngle;
-  lastDetent = detentLevel();
-  detentInitialized = true;
-  Serial.print("BLE: remapped walls so this pose is ");
-  Serial.print(lastDetent);
-  Serial.print("/");
-  Serial.print(numDetents);
-  Serial.print(" (");
-  Serial.print(percent);
-  Serial.println("%)");
-  notifyStatus();
-}
-
-void notifyFocusTrigger(uint8_t value) {
-  if (triggerChar == nullptr || !bleConnected) {
-    Serial.println("BLE: focus trigger skipped (not connected)");
-    return;
-  }
-  triggerChar->setValue(&value, 1);
-  triggerChar->notify();
-  if (value == 2) {
-    Serial.println("BLE: focus off");
-  } else {
-    Serial.println("BLE: focus trigger");
-  }
-}
-
-class ServerCallbacks : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
-    bleConnected = true;
-    Serial.print("BLE: isConnected = true, handle ");
-    Serial.println(connInfo.getConnHandle());
-  }
-
-  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
-    bleConnected = pServer->getConnectedCount() > 0;
-    Serial.print("BLE: disconnect handle ");
-    Serial.print(connInfo.getConnHandle());
-    Serial.print(", reason ");
-    Serial.println(reason);
-    startKnobAdvertising();
-  }
-};
-
-class VolumeCallbacks : public NimBLECharacteristicCallbacks {
-  void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
-    NimBLEAttValue value = pChar->getValue();
-    if (value.size() >= 1) {
-      remapPercent = value.data()[0];
-      remapPending = true;
-    }
-  }
-};
-
-ServerCallbacks serverCallbacks;
-VolumeCallbacks volumeCallbacks;
-
-void startKnobAdvertising() {
-  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-  adv->stop();
-
-  NimBLEAdvertisementData advData;
-  advData.setName("SmartKnob");
-  NimBLEAdvertisementData scanData;
-  scanData.addServiceUUID(SK_SERVICE_UUID);
-  adv->setAdvertisementData(advData);
-  adv->setScanResponseData(scanData);
-  adv->start();
-}
-
-void startBle() {
-  NimBLEDevice::init("SmartKnob");
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-
-  knobServer = NimBLEDevice::createServer();
-  knobServer->setCallbacks(&serverCallbacks);
-
-  NimBLEService* service = knobServer->createService(SK_SERVICE_UUID);
-
-  statusChar = service->createCharacteristic(
-    SK_STATUS_UUID,
-    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
-  );
-
-  NimBLECharacteristic* volumeChar = service->createCharacteristic(
-    SK_VOLUME_UUID,
-    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
-  );
-  volumeChar->setCallbacks(&volumeCallbacks);
-
-  triggerChar = service->createCharacteristic(
-    SK_TRIGGER_UUID,
-    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
-  );
-
-  service->start();
-  startKnobAdvertising();
-}
-
 void setup() {
   Serial.begin(115200);
   delay(200); // USB serial after a reboot, so the next lines actually show up
@@ -240,6 +80,11 @@ void setup() {
   Serial.println(resetReasonText(esp_reset_reason()));
   Serial.print("Free heap: ");
   Serial.println(ESP.getFreeHeap());
+
+  tft.init();
+  tft.setRotation(0);
+  drawScreen_1();
+  Serial.println("TFT: GC9A01 init ok");
 
   SimpleFOCDebug::enable(&Serial);
   motor.useMonitoring(Serial);
