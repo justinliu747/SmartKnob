@@ -10,7 +10,7 @@ uint8_t percentFromLevel(int level) {
 }
 
 void notifyStatus() {
-  if (statusChar == nullptr || !bleConnected) {
+  if (statusChar == nullptr || !bleConnected || uiScreen != SCREEN_VOLUME) {
     return;
   }
   int level = detentLevel();
@@ -33,6 +33,7 @@ void applyVolumeRemap(uint8_t percent) {
   // currentAngle = -(sensor.getAngle() - startAngle) = startAngle - sensor.getAngle()
   startAngle = sensor.getAngle() + targetAngle;
   currentAngle = targetAngle;
+  lastPcVolume = percent;
   lastDetent = detentLevel();
   detentInitialized = true;
   Serial.print("BLE: remapped walls so this pose is ");
@@ -42,7 +43,8 @@ void applyVolumeRemap(uint8_t percent) {
   Serial.print(" (");
   Serial.print(percent);
   Serial.println("%)");
-  notifyStatus();
+  statusNotifyPending = true;
+  uiDirty = true;
 }
 
 void notifyFocusTrigger(uint8_t value) {
@@ -52,8 +54,10 @@ void notifyFocusTrigger(uint8_t value) {
   }
   triggerChar->setValue(&value, 1);
   triggerChar->notify();
-  if (value == 2) {
+  if (value == TRIGGER_FOCUS_OFF) {
     Serial.println("BLE: focus off");
+  } else if (value == TRIGGER_PLAY_PAUSE) {
+    Serial.println("BLE: play/pause");
   } else {
     Serial.println("BLE: focus trigger");
   }
