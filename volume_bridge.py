@@ -1,6 +1,7 @@
 """SmartKnob Windows bridge: BLE status + system volume, simple GUI."""
 
 import asyncio
+import ctypes
 import smtplib
 import threading
 import time
@@ -25,6 +26,10 @@ FOCUS_OFF_SUBJECT = "focus off"
 FOCUS_BODY = "sent from smartknob"
 TRIGGER_ON = 1
 TRIGGER_OFF = 2
+TRIGGER_PLAY_PAUSE = 3
+VK_MEDIA_PLAY_PAUSE = 0xB3
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_KEYUP = 0x0002
 ICLOUD_SMTP = "smtp.mail.icloud.com"
 ICLOUD_SMTP_PORT = 587
 
@@ -46,6 +51,14 @@ def load_env(path):
         key, _, value = line.partition("=")
         values[key.strip()] = value.strip().strip('"').strip("'")
     return values
+
+
+def send_play_pause():
+    user32 = ctypes.windll.user32
+    user32.keybd_event(VK_MEDIA_PLAY_PAUSE, 0, KEYEVENTF_EXTENDEDKEY, 0)
+    user32.keybd_event(
+        VK_MEDIA_PLAY_PAUSE, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0
+    )
 
 
 def send_focus_email(subject):
@@ -171,6 +184,11 @@ class KnobApp:
 
     async def on_trigger(self, _sender, data):
         kind = data[0] if data else TRIGGER_ON
+        if kind == TRIGGER_PLAY_PAUSE:
+            send_play_pause()
+            print("Media: play/pause", flush=True)
+            self.set_email_status("Play/Pause")
+            return
         subject = FOCUS_OFF_SUBJECT if kind == TRIGGER_OFF else FOCUS_ON_SUBJECT
         self.set_email_status(f"Sending {subject}…")
         threading.Thread(
