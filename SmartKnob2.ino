@@ -24,23 +24,27 @@
 #define TRIGGER_FOCUS_OFF 2
 #define TRIGGER_PLAY_PAUSE 3
 
-#define SCREEN_MENU   0
-#define SCREEN_VOLUME 1
-#define SCREEN_FOCUS  2
+#define SCREEN_MENU    0
+#define SCREEN_VOLUME  1
+#define SCREEN_FOCUS   2
+#define SCREEN_DAVINCI 3
 
 #define FOCUS_IDLE    0
 #define FOCUS_RUNNING 1
 #define FOCUS_DONE    2
 
-#define MENU_COUNT 2
+#define MENU_COUNT 3
 #define FOCUS_MAX_MINUTES 99
 #define MENU_CLICK_SIZE (2.0f * PI / 12.0f)
+#define DAVINCI_TRIM_SIZE (2.0f * PI / 180.0f)
 
 #define HAPTIC_NONE          0
 #define HAPTIC_MENU          1
 #define HAPTIC_VOLUME        2
 #define HAPTIC_FOCUS_CONFIG  3
 #define HAPTIC_SPRING        4
+#define HAPTIC_DAVINCI       5
+#define HAPTIC_DAVINCI_TRIM  6
 
 #define BTN_NONE   0
 #define BTN_SHORT  1
@@ -96,6 +100,7 @@ int lastNotifiedDetent = -1;
 
 volatile bool remapPending = false;
 volatile uint8_t remapPercent = 0;
+volatile bool davinciTrim = false;
 volatile bool triggerPending = false;
 volatile uint8_t triggerValue = 1;
 volatile int hapticPending = HAPTIC_NONE;
@@ -194,6 +199,14 @@ void applyHaptic(int kind) {
     startAngle = sensor.getAngle();
     currentAngle = 0;
     detentInitialized = false;
+  } else if (kind == HAPTIC_DAVINCI || kind == HAPTIC_DAVINCI_TRIM) {
+    wrapDetents = true;
+    detentSize = (kind == HAPTIC_DAVINCI_TRIM) ? DAVINCI_TRIM_SIZE : MENU_CLICK_SIZE;
+    startAngle = sensor.getAngle();
+    currentAngle = 0;
+    lastDetent = 0;
+    detentInitialized = true;
+    statusNotifyPending = true;
   }
 }
 
@@ -211,6 +224,7 @@ unsigned long focusRemainingMs() {
 void enterMenu() {
   uiScreen = SCREEN_MENU;
   profile = 2;
+  davinciTrim = false;
   uiDirty = true;
   hapticPending = HAPTIC_MENU;
 }
@@ -220,6 +234,14 @@ void enterVolume() {
   profile = 2;
   uiDirty = true;
   hapticPending = HAPTIC_VOLUME;
+}
+
+void enterDavinci() {
+  uiScreen = SCREEN_DAVINCI;
+  profile = 4;
+  davinciTrim = false;
+  uiDirty = true;
+  hapticPending = HAPTIC_DAVINCI;
 }
 
 void enterFocus() {
@@ -365,24 +387,34 @@ void handleButton(int ev) {
     if (uiScreen == SCREEN_MENU) {
       if (menuIndex == 0) {
         enterVolume();
-      } else {
+      } else if (menuIndex == 1) {
         enterFocus();
+      } else {
+        enterDavinci();
       }
     } else if (uiScreen == SCREEN_VOLUME) {
       notifyFocusTrigger(TRIGGER_PLAY_PAUSE);
     } else if (uiScreen == SCREEN_FOCUS && focusPhase == FOCUS_IDLE) {
       startFocusSession();
+    } else if (uiScreen == SCREEN_DAVINCI) {
+      davinciTrim = !davinciTrim;
+      uiDirty = true;
+      hapticPending = davinciTrim ? HAPTIC_DAVINCI_TRIM : HAPTIC_DAVINCI;
     }
   }
 }
 
 void onDetentChanged() {
-  if (wrapDetents) {
+  if (uiScreen == SCREEN_MENU) {
     int idx = wrappedIndex(lastDetent);
     if (idx != menuIndex) {
       menuIndex = idx;
       uiDirty = true;
     }
+    return;
+  }
+  if (uiScreen == SCREEN_DAVINCI) {
+    statusNotifyPending = true;
     return;
   }
   if (uiScreen == SCREEN_VOLUME) {
@@ -458,7 +490,7 @@ void uiTask(void* pv) {
 
     if (bleConnected != bleWasConnected) {
       bleWasConnected = bleConnected;
-      if (bleConnected && uiScreen == SCREEN_VOLUME) {
+      if (bleConnected && (uiScreen == SCREEN_VOLUME || uiScreen == SCREEN_DAVINCI)) {
         statusNotifyPending = true;
       }
     }
@@ -492,11 +524,12 @@ void uiTask(void* pv) {
 
 void setup() {
   Serial.begin(115200);
-  delay(200); // USB serial after a reboot, so the next lines actually show up
+  delay(200);
   Serial.println();
-  Serial.print("Reset reason: ");
-  Serial.println(resetReasonText(esp_reset_reason()));
-  Serial.print("Free heap: ");
+  Serial.println("SmartKnob");
+  Serial.print("reset=");
+  Serial.print(resetReasonText(esp_reset_reason()));
+  Serial.print("  heap=");
   Serial.println(ESP.getFreeHeap());
 
   pinMode(BTN_PIN, INPUT_PULLUP);
@@ -504,50 +537,36 @@ void setup() {
   tft.init();
   tft.setRotation(0);
   tft.fillScreen(TFT_BLACK);
-  Serial.println("TFT: GC9A01 init ok");
 
-  SimpleFOCDebug::enable(&Serial);
-
-  // Init MT6701 Encoder using your custom functions
   sensor.init();
   motor.linkSensor(&sensor);
 
-  // Init driver
   driver.voltage_power_supply = 9;
   driver.init();
   motor.linkDriver(&driver);
 
-  // Motor config
   motor.controller = MotionControlType::torque;
   motor.voltage_limit = 9;
 
-  // Init PID settings (P and D set within modes)
   motor.PID_velocity.I = 0.00;
   motor.PID_velocity.limit = pidLimit;
 
-  // Init motor & FOC (calibrates the motor automatically)
   motor.init();
   motor.initFOC();
 
-  // Get init angle
   sensor.update();
   startAngle = sensor.getAngle();
 
-  Serial.println("Motor ready!");
-  Serial.println("Send '1', '2', or '3' to switch profiles. Send 's' for focus trigger, 'f' for focus off.");
-
   startBle();
-  Serial.println("BLE: advertising as SmartKnob");
-  Serial.print("Free heap after BLE begin: ");
-  Serial.println(ESP.getFreeHeap());
 
   if (spr.createSprite(240, 240) == nullptr) {
-    Serial.println("TFT: sprite alloc failed");
+    Serial.println("TFT sprite alloc failed");
   } else {
     spriteOk = true;
-    Serial.print("Free heap after sprite: ");
-    Serial.println(ESP.getFreeHeap());
   }
+
+  Serial.print("TFT ok  motor ok  BLE advertising  ");
+  Serial.println(spriteOk ? "sprite ok" : "sprite FAILED");
 
   enterMenu();
   applyHaptic(HAPTIC_MENU);
@@ -563,11 +582,11 @@ void loop() {
 
   if (remapPending) {
     remapPending = false;
-    lastPcVolume = remapPercent;
-    if (lastPcVolume > 100) {
-      lastPcVolume = 100;
-    }
     if (uiScreen == SCREEN_VOLUME) {
+      lastPcVolume = remapPercent;
+      if (lastPcVolume > 100) {
+        lastPcVolume = 100;
+      }
       applyVolumeRemap(lastPcVolume);
       uiDirty = true;
     }
@@ -583,7 +602,7 @@ void loop() {
   // CCW from user perspective (UP) is +tive angle
   currentAngle = -(sensor.getAngle() - startAngle);
 
-  if (uiScreen == SCREEN_MENU) {
+  if (uiScreen == SCREEN_MENU || uiScreen == SCREEN_DAVINCI) {
     runDetents(true);
   } else if (uiScreen == SCREEN_VOLUME) {
     runDetents(false);
