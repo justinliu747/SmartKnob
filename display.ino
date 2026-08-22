@@ -34,8 +34,8 @@ void drawMenu() {
   spr.setTextDatum(MC_DATUM);
   spr.setTextSize(2);
 
-  const char* labels[MENU_COUNT] = {"Volume", "Focus"};
-  const int ys[MENU_COUNT] = {100, 140};
+  const char* labels[MENU_COUNT] = {"Volume", "Focus", "Davinci"};
+  const int ys[MENU_COUNT] = {88, 120, 152};
   for (int i = 0; i < MENU_COUNT; i++) {
     if (i == menuIndex) {
       spr.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -96,6 +96,24 @@ void drawFocusOverlay() {
   spr.drawString(buf, 120, 122);
 }
 
+void drawDavinci() {
+  spr.fillSprite(TFT_BLACK);
+  spr.setTextDatum(MC_DATUM);
+  spr.setTextSize(2);
+
+  const char* labels[2] = {"Cut Jump", "Trim"};
+  const int ys[2] = {104, 136};
+  int active = davinciTrim ? 1 : 0;
+  for (int i = 0; i < 2; i++) {
+    if (i == active) {
+      spr.setTextColor(TFT_WHITE, TFT_BLACK);
+    } else {
+      spr.setTextColor(0x8410, TFT_BLACK);
+    }
+    spr.drawString(labels[i], 120, ys[i]);
+  }
+}
+
 void updateUi() {
   if (!uiDirty || !spriteOk) {
     return;
@@ -106,6 +124,8 @@ void updateUi() {
     drawMenu();
   } else if (uiScreen == SCREEN_VOLUME) {
     drawVolume();
+  } else if (uiScreen == SCREEN_DAVINCI) {
+    drawDavinci();
   } else {
     drawFocus();
   }

@@ -10,19 +10,28 @@ uint8_t percentFromLevel(int level) {
 }
 
 void notifyStatus() {
-  if (statusChar == nullptr || !bleConnected || uiScreen != SCREEN_VOLUME) {
+  if (statusChar == nullptr || !bleConnected) {
     return;
   }
-  int level = detentLevel();
+  if (uiScreen != SCREEN_VOLUME && uiScreen != SCREEN_DAVINCI) {
+    return;
+  }
   uint8_t packet[4];
   packet[0] = (uint8_t)profile;
-  packet[1] = (uint8_t)level;
-  packet[2] = percentFromLevel(level);
-  packet[3] = (uint8_t)numDetents;
+  if (uiScreen == SCREEN_DAVINCI) {
+    packet[1] = (uint8_t)lastDetent;
+    packet[2] = davinciTrim ? 1 : 0;
+    packet[3] = 0;
+  } else {
+    int level = detentLevel();
+    packet[1] = (uint8_t)level;
+    packet[2] = percentFromLevel(level);
+    packet[3] = (uint8_t)numDetents;
+    lastNotifiedDetent = level;
+  }
   statusChar->setValue(packet, 4);
   statusChar->notify();
   lastNotifiedMode = profile;
-  lastNotifiedDetent = level;
 }
 
 void applyVolumeRemap(uint8_t percent) {
@@ -36,45 +45,38 @@ void applyVolumeRemap(uint8_t percent) {
   lastPcVolume = percent;
   lastDetent = detentLevel();
   detentInitialized = true;
-  Serial.print("BLE: remapped walls so this pose is ");
-  Serial.print(lastDetent);
-  Serial.print("/");
-  Serial.print(numDetents);
-  Serial.print(" (");
+  Serial.print("BLE volume remap ");
   Serial.print(percent);
-  Serial.println("%)");
+  Serial.println("%");
   statusNotifyPending = true;
   uiDirty = true;
 }
 
 void notifyFocusTrigger(uint8_t value) {
   if (triggerChar == nullptr || !bleConnected) {
-    Serial.println("BLE: focus trigger skipped (not connected)");
+    Serial.println("BLE focus skipped (not connected)");
     return;
   }
   triggerChar->setValue(&value, 1);
   triggerChar->notify();
   if (value == TRIGGER_FOCUS_OFF) {
-    Serial.println("BLE: focus off");
+    Serial.println("BLE focus off");
   } else if (value == TRIGGER_PLAY_PAUSE) {
-    Serial.println("BLE: play/pause");
+    Serial.println("BLE play/pause");
   } else {
-    Serial.println("BLE: focus trigger");
+    Serial.println("BLE focus on");
   }
 }
 
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
     bleConnected = true;
-    Serial.print("BLE: isConnected = true, handle ");
-    Serial.println(connInfo.getConnHandle());
+    Serial.println("BLE connect");
   }
 
   void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
     bleConnected = pServer->getConnectedCount() > 0;
-    Serial.print("BLE: disconnect handle ");
-    Serial.print(connInfo.getConnHandle());
-    Serial.print(", reason ");
+    Serial.print("BLE disconnect reason=");
     Serial.println(reason);
     startKnobAdvertising();
   }
