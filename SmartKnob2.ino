@@ -1,4 +1,4 @@
-#include <Wire.h> // Include Wire first
+#include <SPI.h>
 #include <SimpleFOC.h>
 #include <TFT_eSPI.h>
 #include <NimBLEDevice.h>
@@ -8,12 +8,12 @@
 #define IN1 2
 #define IN2 3
 #define IN3 4
-#define I2C_SDA 13
-#define I2C_SCL 12
-#define BTN_PIN 10
+#define ENC_MISO 13
+#define ENC_MOSI 12
+#define ENC_SCLK 11
+#define ENC_CS   10
 
-// Standard 7-bit address for Arduino Wire library (No need to bitshift!)
-#define MT6701_ADDR 0x06
+SPIClass encoderSPI(FSPI);
 
 #define SK_SERVICE_UUID  "cba1d411-0e8f-4e5c-8a21-6f3c9b01a001"
 #define SK_STATUS_UUID   "cba1d411-0e8f-4e5c-8a21-6f3c9b01a002"
@@ -54,9 +54,16 @@
 #define BTN_LONG_MS 700
 #define BTN_DOUBLE_MS 400
 
+#define CLICK_TORQUE 9.0f
+#define CLICK_HALF_MS 10
+
 // Other .ino files are concatenated after this one; globals here need prototypes.
 float encoderGetAngle();
-void encoderI2CInit();
+void encoderInit();
+bool encoderPressDown();
+void encoderCalStart();
+void encoderCalFinish();
+void encoderPrintAgc();
 void startBle();
 void applyVolumeRemap(uint8_t percent);
 void notifyFocusTrigger(uint8_t value);
@@ -73,11 +80,12 @@ TFT_eSprite spr = TFT_eSprite(&tft);
 bool spriteOk = false;
 
 // Re-link your custom sensor
-GenericSensor sensor = GenericSensor(encoderGetAngle, encoderI2CInit);
+GenericSensor sensor = GenericSensor(encoderGetAngle, encoderInit);
 
 // --- Profile Variables ---
 float startAngle = 0;
 float currentAngle = 0;
+float knobVel = 0;
 
 int pidLimit = 5;
 int numDetents = 100;
@@ -125,6 +133,14 @@ unsigned long btnPressStartMs = 0;
 bool btnLongFired = false;
 bool btnAwaitDouble = false;
 unsigned long btnFirstClickMs = 0;
+
+volatile bool clickHapticPending = false;
+bool clickRunning = false;
+unsigned long clickStartMs = 0;
+unsigned long clickQuietUntil = 0;
+
+bool agcDebug = false;
+unsigned long lastAgcPrintMs = 0;
 
 NimBLECharacteristic* statusChar = nullptr;
 NimBLECharacteristic* triggerChar = nullptr;
@@ -315,7 +331,7 @@ void tickFocusSession() {
 
 int pollButton() {
   unsigned long now = millis();
-  bool raw = digitalRead(BTN_PIN);
+  bool raw = encoderPressDown() ? LOW : HIGH;
 
   if (raw != btnLastRaw) {
     btnLastRaw = raw;
@@ -441,7 +457,7 @@ void runSpring() {
 void runDetents(bool wrap) {
   prevProfile = 2;
   motor.PID_velocity.P = 10;
-  motor.PID_velocity.D = 0.05;
+  motor.PID_velocity.D = 0.0;
 
   closestDetent = round(currentAngle / detentSize) * detentSize;
   float angleToDetent = closestDetent - currentAngle;
@@ -455,7 +471,7 @@ void runDetents(bool wrap) {
     }
   }
 
-  userTorque = motor.PID_velocity(angleToDetent);
+  userTorque = motor.PID_velocity(angleToDetent) - 0.05f * knobVel;
   maxTorque = detentSize / 2.0f * 10.0f;
 
   int detent = (int)round(currentAngle / detentSize);
@@ -466,19 +482,21 @@ void runDetents(bool wrap) {
     detentInitialized = true;
   } else if (detent != lastDetent && inRange) {
     lastDetent = detent;
-    onDetentChanged();
+    if (millis() >= clickQuietUntil) {
+      onDetentChanged();
+    }
   }
 }
 
 void runSwitch() {
   prevProfile = 3;
   motor.PID_velocity.P = 7;
-  motor.PID_velocity.D = 0.03;
+  motor.PID_velocity.D = 0.0;
   float angleToDetent = 0.0f - currentAngle;
   if (currentAngle >= PI / 4.0f) {
     angleToDetent = PI / 2.0f - currentAngle;
   }
-  userTorque = motor.PID_velocity(angleToDetent);
+  userTorque = motor.PID_velocity(angleToDetent) - 0.03f * knobVel;
 }
 
 void uiTask(void* pv) {
@@ -513,6 +531,14 @@ void uiTask(void* pv) {
         triggerValue = TRIGGER_FOCUS_OFF;
         triggerPending = true;
       }
+      if (inChar == 'a' || inChar == 'A') {
+        agcDebug = !agcDebug;
+      }
+    }
+
+    if (agcDebug && millis() - lastAgcPrintMs >= 50) {
+      lastAgcPrintMs = millis();
+      encoderPrintAgc();
     }
 
     handleButton(pollButton());
@@ -520,6 +546,22 @@ void uiTask(void* pv) {
     updateUi();
     vTaskDelay(1);
   }
+}
+
+// Open-loop sweep a little over one turn each way; keep hands off the knob.
+void calibrateAgc() {
+  motor.controller = MotionControlType::velocity_openloop;
+  motor.voltage_limit = 3;
+  encoderCalStart();
+  unsigned long t0 = millis();
+  while (millis() - t0 < 4000) {
+    motor.loopFOC();
+    motor.move((millis() - t0) < 2000 ? 3.5f : -3.5f);
+  }
+  encoderCalFinish();
+  motor.controller = MotionControlType::torque;
+  motor.voltage_limit = 9;
+  motor.move(0);
 }
 
 void setup() {
@@ -531,8 +573,6 @@ void setup() {
   Serial.print(resetReasonText(esp_reset_reason()));
   Serial.print("  heap=");
   Serial.println(ESP.getFreeHeap());
-
-  pinMode(BTN_PIN, INPUT_PULLUP);
 
   tft.init();
   tft.setRotation(0);
@@ -553,6 +593,13 @@ void setup() {
 
   motor.init();
   motor.initFOC();
+
+  Serial.print("zero_electric_angle=");
+  Serial.print(motor.zero_electric_angle);
+  Serial.print("  sensor_direction=");
+  Serial.println((int)motor.sensor_direction);
+
+  calibrateAgc();
 
   sensor.update();
   startAngle = sensor.getAngle();
@@ -578,7 +625,6 @@ void setup() {
 
 void loop() {
   motor.loopFOC();
-  sensor.update();
 
   if (remapPending) {
     remapPending = false;
@@ -598,9 +644,18 @@ void loop() {
     applyHaptic(haptic);
   }
 
+  if (clickHapticPending) {
+    clickHapticPending = false;
+    clickRunning = true;
+    clickStartMs = millis();
+    clickQuietUntil = clickStartMs + 150;
+  }
+
   // CW from encoder perspective (EP) is +tive angle
   // CCW from user perspective (UP) is +tive angle
-  currentAngle = -(sensor.getAngle() - startAngle);
+  float rawAngle = -(sensor.getAngle() - startAngle);
+  currentAngle += (rawAngle - currentAngle) * 0.25f;
+  knobVel = -motor.shaft_velocity * (float)motor.sensor_direction;
 
   if (uiScreen == SCREEN_MENU || uiScreen == SCREEN_DAVINCI) {
     runDetents(true);
@@ -612,6 +667,17 @@ void loop() {
     runSwitch();
   } else {
     runSpring();
+  }
+
+  if (clickRunning) {
+    unsigned long t = millis() - clickStartMs;
+    if (t < CLICK_HALF_MS) {
+      userTorque = CLICK_TORQUE;
+    } else if (t < (2 * CLICK_HALF_MS)) {
+      userTorque = -CLICK_TORQUE;
+    } else {
+      clickRunning = false;
+    }
   }
 
   motor.move(-userTorque);
