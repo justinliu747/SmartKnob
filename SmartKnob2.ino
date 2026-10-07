@@ -57,6 +57,16 @@ SPIClass encoderSPI(FSPI);
 #define CLICK_TORQUE 9.0f
 #define CLICK_HALF_MS 10
 
+// Plain P springs: SimpleFOC's PID with I=0, D=0 is just P plus a clamp, so we do that directly.
+#define DETENT_P 10.0f
+// Peak detent force is P * half the detent width, so 3.6 deg volume/timer detents get ~10x less than the menu at the same P.
+#define SMALL_DETENT_P 30.0f
+#define SMALL_DETENT_SIZE (10.0f * DEG_TO_RAD)
+#define SPRING_P 3.0f
+#define SPRING_LIMIT 5.0f       // volts; caps the spring so the stiff end walls don't slam
+#define DAMPING 0.08f           // volts per rad/s; stops wall overshoot and the forward tug on small detents
+#define DAMP_DEADBAND 1.0f      // rad/s; velocity noise at rest is ~0.3, so the damper stays silent
+
 // Other .ino files are concatenated after this one; globals here need prototypes.
 float encoderGetAngle();
 void encoderInit();
@@ -87,16 +97,13 @@ float startAngle = 0;
 float currentAngle = 0;
 float knobVel = 0;
 
-int pidLimit = 5;
 int numDetents = 100;
 float detentSize = 2.0f * PI / (float)numDetents;
 float closestDetent = 0.0f;
 
 int profile = 2;
-int prevProfile = 2;
 
 float userTorque = 0.0f;
-float maxTorque = pidLimit;
 
 int lastDetent = 0;
 bool detentInitialized = false;
@@ -447,32 +454,35 @@ void onDetentChanged() {
 }
 
 void runSpring() {
-  prevProfile = 1;
-  motor.PID_velocity.P = 3;
-  motor.PID_velocity.D = 0.00;
   float angleToCenter = 0 - currentAngle;
-  userTorque = motor.PID_velocity(angleToCenter);
+  userTorque = _constrain(SPRING_P * angleToCenter, -SPRING_LIMIT, SPRING_LIMIT);
 }
 
 void runDetents(bool wrap) {
-  prevProfile = 2;
-  motor.PID_velocity.P = 10;
-  motor.PID_velocity.D = 0.0;
-
   closestDetent = round(currentAngle / detentSize) * detentSize;
   float angleToDetent = closestDetent - currentAngle;
+  // Zero spring force near the detent center so angle jitter there doesn't reach the coils.
+  float deadZone = fminf(detentSize * 0.1f, 0.5f * DEG_TO_RAD);
+  angleToDetent -= _constrain(angleToDetent, -deadZone, deadZone);
 
+  float p = (detentSize < SMALL_DETENT_SIZE) ? SMALL_DETENT_P : DETENT_P;
+
+  // Walls keep DETENT_P; the small-detent P would make them 3x stiffer and bounce harder on release.
   if (!wrap) {
     if (currentAngle < 0) {
       angleToDetent = 3 * (0 - currentAngle);
+      p = DETENT_P;
     }
     if (currentAngle > 2.0f * PI) {
       angleToDetent = 3 * (2.0f * PI - currentAngle);
+      p = DETENT_P;
     }
   }
 
-  userTorque = motor.PID_velocity(angleToDetent) - 0.05f * knobVel;
-  maxTorque = detentSize / 2.0f * 10.0f;
+  // Damp on filtered velocity, not a PID D term: D divides sensor jitter by the ~43 us loop time and rumbles.
+  // Inside the deadband dampVel is exactly 0; outside it ramps up from 0 so there is no step.
+  float dampVel = knobVel - _constrain(knobVel, -DAMP_DEADBAND, DAMP_DEADBAND);
+  userTorque = _constrain(p * angleToDetent, -SPRING_LIMIT, SPRING_LIMIT) - DAMPING * dampVel;
 
   int detent = (int)round(currentAngle / detentSize);
   bool inRange = wrap || (currentAngle >= 0.0f && currentAngle <= 2.0f * PI);
@@ -489,14 +499,12 @@ void runDetents(bool wrap) {
 }
 
 void runSwitch() {
-  prevProfile = 3;
-  motor.PID_velocity.P = 7;
-  motor.PID_velocity.D = 0.0;
   float angleToDetent = 0.0f - currentAngle;
   if (currentAngle >= PI / 4.0f) {
     angleToDetent = PI / 2.0f - currentAngle;
   }
-  userTorque = motor.PID_velocity(angleToDetent) - 0.03f * knobVel;
+  float dampVel = knobVel - _constrain(knobVel, -DAMP_DEADBAND, DAMP_DEADBAND);
+  userTorque = _constrain(7.0f * angleToDetent, -SPRING_LIMIT, SPRING_LIMIT) - 0.03f * dampVel;
 }
 
 void uiTask(void* pv) {
@@ -590,9 +598,6 @@ void setup() {
   motor.controller = MotionControlType::torque;
   motor.voltage_limit = 9;
 
-  motor.PID_velocity.I = 0.00;
-  motor.PID_velocity.limit = pidLimit;
-
   motor.init();
   motor.initFOC();
 
@@ -625,6 +630,7 @@ void setup() {
   xTaskCreatePinnedToCore(uiTask, "ui", 8192, nullptr, 1, nullptr, 0);
 }
 
+// No delay: core 1 runs only this (~23 kHz), which keeps torque smooth and inaudible and lets stiff springs stay stable.
 void loop() {
   motor.loopFOC();
 
@@ -657,6 +663,7 @@ void loop() {
   // CCW from user perspective (UP) is +tive angle
   float rawAngle = -(sensor.getAngle() - startAngle);
   currentAngle += (rawAngle - currentAngle) * 0.25f;
+  // shaft_velocity is sensor velocity through SimpleFOC's 5 ms low-pass; raw velocity is too noisy to damp on.
   knobVel = -motor.shaft_velocity * (float)motor.sensor_direction;
 
   if (uiScreen == SCREEN_MENU || uiScreen == SCREEN_DAVINCI) {
