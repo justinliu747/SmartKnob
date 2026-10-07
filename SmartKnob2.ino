@@ -50,7 +50,6 @@ SPIClass encoderSPI(FSPI);
 #define BTN_SHORT  1
 #define BTN_LONG   2
 #define BTN_DOUBLE 3
-#define BTN_DEBOUNCE_MS 40
 #define BTN_LONG_MS 700
 #define BTN_DOUBLE_MS 400
 
@@ -71,8 +70,7 @@ SPIClass encoderSPI(FSPI);
 float encoderGetAngle();
 void encoderInit();
 bool encoderPressDown();
-void encoderCalStart();
-void encoderCalFinish();
+void encoderStartPress();
 void encoderPrintAgc();
 void startBle();
 void applyVolumeRemap(uint8_t percent);
@@ -133,9 +131,7 @@ unsigned long focusTargetMs = 0;
 int focusElapsedMinutes = 0;
 int lastDrawnFocusSec = -1;
 
-bool btnLastRaw = HIGH;
 bool btnStable = HIGH;
-unsigned long btnLastChangeMs = 0;
 unsigned long btnPressStartMs = 0;
 bool btnLongFired = false;
 bool btnAwaitDouble = false;
@@ -340,12 +336,7 @@ int pollButton() {
   unsigned long now = millis();
   bool raw = encoderPressDown() ? LOW : HIGH;
 
-  if (raw != btnLastRaw) {
-    btnLastRaw = raw;
-    btnLastChangeMs = now;
-  }
-
-  if ((now - btnLastChangeMs) >= BTN_DEBOUNCE_MS && raw != btnStable) {
+  if (raw != btnStable) {
     btnStable = raw;
     if (btnStable == LOW) {
       btnPressStartMs = now;
@@ -556,22 +547,6 @@ void uiTask(void* pv) {
   }
 }
 
-// Open-loop sweep a little over one turn each way; keep hands off the knob.
-void calibrateAgc() {
-  motor.controller = MotionControlType::velocity_openloop;
-  motor.voltage_limit = 3;
-  encoderCalStart();
-  unsigned long t0 = millis();
-  while (millis() - t0 < 4000) {
-    motor.loopFOC();
-    motor.move((millis() - t0) < 2000 ? 3.5f : -3.5f);
-  }
-  encoderCalFinish();
-  motor.controller = MotionControlType::torque;
-  motor.voltage_limit = 9;
-  motor.move(0);
-}
-
 void setup() {
   Serial.begin(115200);
   // USB CDC blocks up to 2 s per write when the PC isn't reading the port; drop output instead.
@@ -606,7 +581,7 @@ void setup() {
   Serial.print("  sensor_direction=");
   Serial.println((int)motor.sensor_direction);
 
-  calibrateAgc();
+  encoderStartPress();
 
   sensor.update();
   startAngle = sensor.getAngle();

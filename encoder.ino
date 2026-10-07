@@ -3,12 +3,14 @@ static const uint16_t AS5048A_READ_AGC = 0x7FFD;  // DIAAGC, even parity
 static const uint16_t AS5048A_READ_ERRFL = 0x4001;
 static const SPISettings ENC_SPI_SETTINGS(1000000, MSBFIRST, SPI_MODE1);
 
-#define AGC_PRESS_DELTA 6
-#define AGC_RELEASE_DELTA 2
+// AGC moves in steps of ~3 and slews ~3 counts per 10-20 ms; a grip while turning drops 3-6.
+#define AGC_PRESS_DELTA 12
+#define AGC_RELEASE_DELTA 6
+#define AGC_TRACK_BAND 3       // rest only follows readings within one AGC step
 #define AGC_DRIFT 0.005f
+#define AGC_MIN_HOLD_MS 80     // covers the click kick and flexure bounce
+#define AGC_SETTLE_SAMPLES 20
 #define AGC_READ_MS 10
-#define AGC_CAL_READ_MS 2
-#define AGC_BINS 128           // raw angle >> 7, 2.8 deg per bin
 #define ENC_JUMP_COUNTS 2048   // 1/8 turn
 #define ENC_JUMP_MS 5
 
@@ -19,14 +21,11 @@ static uint8_t lastAgc = 0;
 static unsigned long lastAgcReadMs = 0;
 static unsigned long lastGoodMs = 0;
 static volatile bool encBtnDown = false;
+static unsigned long pressStartMs = 0;
+static uint8_t agcSettle = 0;
 
-static bool agcCalibrating = false;
 static bool agcReady = false;
-static uint32_t agcSum[AGC_BINS];
-static uint16_t agcCount[AGC_BINS];
-static float agcTable[AGC_BINS];
-static float agcOffset = 0.0f;
-static float agcExpected = 0.0f;
+static float agcRest = 0.0f;
 static float agcDrop = 0.0f;
 static float agcPeakDrop = 0.0f;
 
@@ -52,11 +51,23 @@ static bool encoderFrameOk(uint16_t raw) {
   return ((x & 1) == (raw >> 15));
 }
 
-static void encoderReadAgc() {
+// ERRFL contents come back on the next frame, so flush it with a throwaway read.
+static void encoderClearError() {
+  encoderTransfer(AS5048A_READ_ERRFL);
+  encoderTransfer(AS5048A_READ_ANGLE);
+}
+
+static bool encoderReadAgc() {
   encoderTransfer(AS5048A_READ_AGC);
   uint16_t diag = encoderTransfer(AS5048A_READ_ANGLE);
-  uint16_t data = diag & 0x3FFF;
-  lastAgc = data & 0xFF;
+  if (!encoderFrameOk(diag)) {
+    if (diag & 0x4000) {
+      encoderClearError();
+    }
+    return false;
+  }
+  lastAgc = diag & 0xFF;
+  return true;
 }
 
 static uint16_t encoderAngleDelta(uint16_t a, uint16_t b) {
@@ -72,23 +83,18 @@ static uint16_t encoderAngleDelta(uint16_t a, uint16_t b) {
   return (uint16_t)d;
 }
 
-// Bin i is centered at raw angle i*128 + 64.
-static float agcTableAt(uint16_t angle) {
-  float pos = ((float)angle - 64.0f) / 128.0f;
-  if (pos < 0.0f) {
-    pos += AGC_BINS;
+// Readings above rest (field weaker, knob lifted) are never a press and never move rest.
+static void encoderUpdatePress(unsigned long now) {
+  if (agcSettle > 0) {
+    agcSettle--;
+    agcRest += 0.2f * ((float)lastAgc - agcRest);
+    if (agcSettle == 0) {
+      Serial.printf("agc rest=%.1f\n", agcRest);
+    }
+    return;
   }
-  int i = (int)pos;
-  float frac = pos - (float)i;
-  float a = agcTable[i];
-  float b = agcTable[(i + 1) & (AGC_BINS - 1)];
-  return a + (b - a) * frac;
-}
 
-static void encoderUpdatePress(uint16_t angle) {
-  float table = agcTableAt(angle);
-  agcExpected = table + agcOffset;
-  agcDrop = agcExpected - (float)lastAgc;
+  agcDrop = agcRest - (float)lastAgc;
   if (agcDrop > agcPeakDrop) {
     agcPeakDrop = agcDrop;
   }
@@ -96,11 +102,12 @@ static void encoderUpdatePress(uint16_t angle) {
   if (!encBtnDown) {
     if (agcDrop >= AGC_PRESS_DELTA) {
       encBtnDown = true;
+      pressStartMs = now;
       clickHapticPending = true;
-    } else {
-      agcOffset -= AGC_DRIFT * agcDrop;
+    } else if (fabsf(agcDrop) <= AGC_TRACK_BAND) {
+      agcRest -= AGC_DRIFT * agcDrop;
     }
-  } else if (agcDrop <= AGC_RELEASE_DELTA) {
+  } else if (agcDrop <= AGC_RELEASE_DELTA && (now - pressStartMs) >= AGC_MIN_HOLD_MS) {
     encBtnDown = false;
   }
 }
@@ -109,61 +116,19 @@ bool encoderPressDown() {
   return encBtnDown;
 }
 
-void encoderCalStart() {
-  for (int i = 0; i < AGC_BINS; i++) {
-    agcSum[i] = 0;
-    agcCount[i] = 0;
-  }
-  agcCalibrating = true;
-}
-
-void encoderCalFinish() {
-  agcCalibrating = false;
-
-  int first = -1;
-  int empty = 0;
-  for (int i = 0; i < AGC_BINS; i++) {
-    if (agcCount[i] > 0) {
-      agcTable[i] = (float)agcSum[i] / (float)agcCount[i];
-      if (first < 0) {
-        first = i;
-      }
-    } else {
-      empty++;
-    }
-  }
-
-  if (first < 0) {
-    for (int i = 0; i < AGC_BINS; i++) {
-      agcTable[i] = lastAgc;
-    }
-  } else {
-    for (int k = 1; k < AGC_BINS; k++) {
-      int i = (first + k) & (AGC_BINS - 1);
-      if (agcCount[i] == 0) {
-        agcTable[i] = agcTable[(i - 1) & (AGC_BINS - 1)];
-      }
-    }
-  }
-
-  float lo = agcTable[0];
-  float hi = agcTable[0];
-  for (int i = 1; i < AGC_BINS; i++) {
-    if (agcTable[i] < lo) lo = agcTable[i];
-    if (agcTable[i] > hi) hi = agcTable[i];
-  }
-
-  agcOffset = 0.0f;
+// Call once the motor is aligned; rest is learned from the next samples, hands off.
+void encoderStartPress() {
+  agcRest = lastAgc;
   agcPeakDrop = 0.0f;
   encBtnDown = false;
+  agcSettle = AGC_SETTLE_SAMPLES;
   agcReady = true;
-
-  Serial.printf("agc cal min=%.1f max=%.1f empty=%d\n", lo, hi, empty);
 }
 
 void encoderPrintAgc() {
-  Serial.printf("agc=%u exp=%.1f drop=%.1f peak=%.1f down=%d\n",
-                lastAgc, agcExpected, agcDrop, agcPeakDrop, encBtnDown ? 1 : 0);
+  Serial.printf("agc=%u rest=%.1f drop=%.1f peak=%.1f down=%d loop_us=%u\n",
+                lastAgc, agcRest, agcDrop, agcPeakDrop, encBtnDown ? 1 : 0,
+                (unsigned)motor.loopfoc_time_us);
   agcPeakDrop = agcDrop;
 }
 
@@ -188,7 +153,7 @@ float encoderGetAngle() {
   uint16_t raw = encoderTransfer(AS5048A_READ_ANGLE);
   if (!encoderFrameOk(raw)) {
     if (raw & 0x4000) {
-      encoderTransfer(AS5048A_READ_ERRFL);
+      encoderClearError();
     }
     return -1.0f;
   }
@@ -205,16 +170,10 @@ float encoderGetAngle() {
   lastGoodMs = now;
   haveGoodAngle = true;
 
-  unsigned long agcInterval = agcCalibrating ? AGC_CAL_READ_MS : AGC_READ_MS;
-  if (now - lastAgcReadMs >= agcInterval) {
+  if (now - lastAgcReadMs >= AGC_READ_MS) {
     lastAgcReadMs = now;
-    encoderReadAgc();
-    if (agcCalibrating) {
-      int bin = angle >> 7;
-      agcSum[bin] += lastAgc;
-      agcCount[bin]++;
-    } else if (agcReady) {
-      encoderUpdatePress(angle);
+    if (encoderReadAgc() && agcReady) {
+      encoderUpdatePress(now);
     }
   }
 
