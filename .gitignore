@@ -5,6 +5,7 @@ __pycache__/
 venv/
 .env
 .env.*
+logs/
 
 # Local notes and Cursor rules
 notes.md

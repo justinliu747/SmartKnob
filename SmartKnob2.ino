@@ -72,6 +72,9 @@ void encoderInit();
 bool encoderPressDown();
 void encoderStartPress();
 void encoderPrintAgc();
+uint16_t encoderRawAngle();
+uint8_t encoderTakeFlags();
+void encoderDrainLog();
 void startBle();
 void applyVolumeRemap(uint8_t percent);
 void notifyFocusTrigger(uint8_t value);
@@ -140,6 +143,28 @@ unsigned long clickQuietUntil = 0;
 
 bool agcDebug = false;
 unsigned long lastAgcPrintMs = 0;
+
+// Debug logging: 'r' rumble snapshot, 'l' AGC stream, 'z' motor torque off.
+#define RUMBLE_SAMPLES 4000
+#define RUMBLE_PERIOD_US 250
+struct RumbleSample {
+  uint32_t tUs;
+  uint16_t raw;
+  int16_t uqMv;
+  int16_t velCrad;
+  uint16_t maxLoopUs;
+  uint8_t flags;
+};
+RumbleSample rumbleBuf[RUMBLE_SAMPLES];
+volatile bool rumbleStart = false;
+volatile bool rumbleReady = false;
+bool rumbleRec = false;
+int rumbleCount = 0;
+uint32_t rumbleLastUs = 0;
+uint32_t lastLoopUs = 0;
+uint32_t loopMaxUs = 0;
+volatile bool agcLogOn = false;
+volatile bool torqueOff = false;
 
 NimBLECharacteristic* statusChar = nullptr;
 NimBLECharacteristic* triggerChar = nullptr;
@@ -513,6 +538,42 @@ void uiTask(void* pv) {
       if (inChar == 'a' || inChar == 'A') {
         agcDebug = !agcDebug;
       }
+      if (inChar == 'r' || inChar == 'R') {
+        if (!rumbleRec && !rumbleReady) {
+          rumbleStart = true;
+        }
+      }
+      if (inChar == 'l' || inChar == 'L') {
+        agcLogOn = !agcLogOn;
+        Serial.printf("AGC_LOG %d\n", agcLogOn ? 1 : 0);
+        if (agcLogOn) {
+          Serial.println("A,t_ms,raw,agc,rest,drop,down,kick,screen,uq");
+        }
+      }
+      if (inChar == 'z' || inChar == 'Z') {
+        torqueOff = !torqueOff;
+        Serial.printf("TORQUE_OFF %d\n", torqueOff ? 1 : 0);
+      }
+    }
+
+    if (agcLogOn) {
+      encoderDrainLog();
+    }
+
+    if (rumbleReady) {
+      Serial.setTxTimeoutMs(100);  // only requested by knob_log.py, which is reading
+      Serial.printf("R_BEGIN screen=%d torque_off=%d period_us=%d loopfoc_us=%u\n",
+                    uiScreen, torqueOff ? 1 : 0, RUMBLE_PERIOD_US,
+                    (unsigned)motor.loopfoc_time_us);
+      Serial.println("R,t_us,raw,uq,vel,max_loop_us,flags");
+      for (int i = 0; i < RUMBLE_SAMPLES; i++) {
+        const RumbleSample& s = rumbleBuf[i];
+        Serial.printf("R,%lu,%u,%.3f,%.2f,%u,%u\n", (unsigned long)s.tUs, s.raw,
+                      s.uqMv / 1000.0f, s.velCrad / 100.0f, s.maxLoopUs, s.flags);
+      }
+      Serial.println("R_END");
+      Serial.setTxTimeoutMs(0);
+      rumbleReady = false;
     }
 
     if (agcDebug && millis() - lastAgcPrintMs >= 50) {
@@ -585,9 +646,45 @@ void setup() {
   xTaskCreatePinnedToCore(uiTask, "ui", 8192, nullptr, 1, nullptr, 0);
 }
 
+void recordRumble() {
+  uint32_t nowUs = micros();
+  uint32_t dt = nowUs - lastLoopUs;
+  lastLoopUs = nowUs;
+  if (dt > loopMaxUs) {
+    loopMaxUs = dt;
+  }
+
+  if (rumbleStart) {
+    rumbleStart = false;
+    rumbleCount = 0;
+    loopMaxUs = 0;
+    rumbleLastUs = nowUs;
+    encoderTakeFlags();
+    rumbleRec = true;
+    return;
+  }
+  if (!rumbleRec || nowUs - rumbleLastUs < RUMBLE_PERIOD_US) {
+    return;
+  }
+  rumbleLastUs = nowUs;
+  RumbleSample& s = rumbleBuf[rumbleCount++];
+  s.tUs = nowUs;
+  s.raw = encoderRawAngle();
+  s.uqMv = (int16_t)(motor.voltage.q * 1000.0f);
+  s.velCrad = (int16_t)_constrain(knobVel * 100.0f, -32000.0f, 32000.0f);
+  s.maxLoopUs = (uint16_t)_constrain(loopMaxUs, 0, 65535);
+  s.flags = encoderTakeFlags();
+  loopMaxUs = 0;
+  if (rumbleCount >= RUMBLE_SAMPLES) {
+    rumbleRec = false;
+    rumbleReady = true;
+  }
+}
+
 // No delay: core 1 runs only this (~23 kHz), which keeps torque smooth and inaudible and lets stiff springs stay stable.
 void loop() {
   motor.loopFOC();
+  recordRumble();
 
   // Store PC volume on every screen so entering Volume starts at the PC's current level.
   if (remapPending) {
@@ -637,6 +734,10 @@ void loop() {
     } else {
       clickRunning = false;
     }
+  }
+
+  if (torqueOff) {
+    userTorque = 0.0f;
   }
 
   motor.move(-userTorque);

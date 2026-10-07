@@ -29,6 +29,27 @@ static float agcRest = 0.0f;
 static float agcDrop = 0.0f;
 static float agcPeakDrop = 0.0f;
 
+#define ENC_FLAG_BAD_FRAME 1
+#define ENC_FLAG_JUMP      2
+#define ENC_FLAG_AGC_READ  4
+static volatile uint8_t encFlags = 0;
+
+// Filled on core 1 every AGC sample, drained by uiTask on core 0.
+#define AGC_LOG_SIZE 128
+struct AgcLogEntry {
+  uint32_t tMs;
+  uint16_t raw;
+  uint8_t agc;
+  uint8_t down;
+  uint8_t kick;
+  uint8_t screen;
+  int16_t uqMv;
+  float rest;
+};
+static AgcLogEntry agcLog[AGC_LOG_SIZE];
+static volatile uint16_t agcLogHead = 0;
+static uint16_t agcLogTail = 0;
+
 static uint16_t encoderTransfer(uint16_t cmd) {
   encoderSPI.beginTransaction(ENC_SPI_SETTINGS);
   digitalWrite(ENC_CS, LOW);
@@ -125,6 +146,27 @@ void encoderStartPress() {
   agcReady = true;
 }
 
+uint16_t encoderRawAngle() {
+  return lastGoodAngle;
+}
+
+uint8_t encoderTakeFlags() {
+  uint8_t f = encFlags;
+  encFlags = 0;
+  return f;
+}
+
+// A,t_ms,raw,agc,rest,drop,down,kick,screen,uq
+void encoderDrainLog() {
+  while (agcLogTail != agcLogHead) {
+    const AgcLogEntry& e = agcLog[agcLogTail];
+    Serial.printf("A,%lu,%u,%u,%.2f,%.2f,%u,%u,%u,%.3f\n",
+                  (unsigned long)e.tMs, e.raw, e.agc, e.rest, e.rest - (float)e.agc,
+                  e.down, e.kick, e.screen, e.uqMv / 1000.0f);
+    agcLogTail = (agcLogTail + 1) % AGC_LOG_SIZE;
+  }
+}
+
 void encoderPrintAgc() {
   Serial.printf("agc=%u rest=%.1f drop=%.1f peak=%.1f down=%d loop_us=%u\n",
                 lastAgc, agcRest, agcDrop, agcPeakDrop, encBtnDown ? 1 : 0,
@@ -152,6 +194,7 @@ void encoderInit() {
 float encoderGetAngle() {
   uint16_t raw = encoderTransfer(AS5048A_READ_ANGLE);
   if (!encoderFrameOk(raw)) {
+    encFlags |= ENC_FLAG_BAD_FRAME;
     if (raw & 0x4000) {
       encoderClearError();
     }
@@ -162,6 +205,7 @@ float encoderGetAngle() {
   unsigned long now = millis();
   if (haveGoodAngle && encoderAngleDelta(angle, lastGoodAngle) >= ENC_JUMP_COUNTS &&
       (now - lastGoodMs) < ENC_JUMP_MS) {
+    encFlags |= ENC_FLAG_JUMP;
     return -1.0f;
   }
 
@@ -172,8 +216,24 @@ float encoderGetAngle() {
 
   if (now - lastAgcReadMs >= AGC_READ_MS) {
     lastAgcReadMs = now;
+    encFlags |= ENC_FLAG_AGC_READ;
     if (encoderReadAgc() && agcReady) {
       encoderUpdatePress(now);
+      if (agcLogOn) {
+        uint16_t next = (agcLogHead + 1) % AGC_LOG_SIZE;
+        if (next != agcLogTail) {
+          AgcLogEntry& e = agcLog[agcLogHead];
+          e.tMs = now;
+          e.raw = angle;
+          e.agc = lastAgc;
+          e.down = encBtnDown ? 1 : 0;
+          e.kick = clickRunning ? 1 : 0;
+          e.screen = (uint8_t)uiScreen;
+          e.uqMv = (int16_t)(motor.voltage.q * 1000.0f);
+          e.rest = agcRest;
+          agcLogHead = next;
+        }
+      }
     }
   }
 
