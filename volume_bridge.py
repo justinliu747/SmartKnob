@@ -658,23 +658,22 @@ class KnobApp:
             asyncio.run_coroutine_threadsafe(self.shutdown(), self.loop)
         self.root.after(200, self.root.destroy)
 
+    # Knob is told the PC volume on every screen, so entering Volume starts at the PC level.
     def poll_windows_volume(self):
-        if (
-            self.connected
-            and self.client is not None
-            and self.knob_mode == 2
-            and time.monotonic() >= self.ignore_poll_until
-        ):
-            try:
-                scalar = self.endpoint.GetMasterVolumeLevelScalar()
-                percent = int(round(scalar * 100))
-                if self.echo_percent is None or abs(percent - self.echo_percent) > 1:
-                    self.echo_percent = percent
-                    asyncio.run_coroutine_threadsafe(
-                        self.write_percent(percent), self.loop
-                    )
-            except Exception:
-                pass
+        try:
+            percent = int(round(self.endpoint.GetMasterVolumeLevelScalar() * 100))
+            self.volume_var.set(f"{percent}%")
+            self.volume_pct.set(percent)
+            if (
+                self.connected
+                and self.client is not None
+                and time.monotonic() >= self.ignore_poll_until
+                and (self.echo_percent is None or abs(percent - self.echo_percent) > 1)
+            ):
+                self.echo_percent = percent
+                asyncio.run_coroutine_threadsafe(self.write_percent(percent), self.loop)
+        except Exception:
+            pass
         self.root.after(250, self.poll_windows_volume)
 
     async def write_percent(self, percent):
@@ -763,8 +762,7 @@ class KnobApp:
                         self.set_email_status(f"Trigger unavailable: {exc}")
                     percent = int(round(self.endpoint.GetMasterVolumeLevelScalar() * 100))
                     self.echo_percent = percent
-                    if self.knob_mode == 2:
-                        await self.write_percent(percent)
+                    await self.write_percent(percent)
                     while client.is_connected:
                         await asyncio.sleep(0.2)
             except Exception as exc:

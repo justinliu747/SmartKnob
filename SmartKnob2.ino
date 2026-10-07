@@ -609,15 +609,12 @@ void setup() {
 void loop() {
   motor.loopFOC();
 
+  // Store PC volume on every screen so entering Volume starts at the PC's current level.
   if (remapPending) {
     remapPending = false;
+    lastPcVolume = remapPercent > 100 ? 100 : remapPercent;
     if (uiScreen == SCREEN_VOLUME) {
-      lastPcVolume = remapPercent;
-      if (lastPcVolume > 100) {
-        lastPcVolume = 100;
-      }
       applyVolumeRemap(lastPcVolume);
-      uiDirty = true;
     }
   }
 
