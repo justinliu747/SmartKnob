@@ -1,7 +1,7 @@
 static const uint16_t AS5048A_READ_ANGLE = 0xFFFF;
 static const uint16_t AS5048A_READ_AGC = 0x7FFD;  // DIAAGC, even parity
 static const uint16_t AS5048A_READ_ERRFL = 0x4001;
-static const SPISettings ENC_SPI_SETTINGS(1000000, MSBFIRST, SPI_MODE1);
+static const SPISettings ENC_SPI_SETTINGS(4000000, MSBFIRST, SPI_MODE1);
 
 // AGC moves in steps of ~3 and slews ~3 counts per 10-20 ms; a grip while turning drops 3-6.
 #define AGC_PRESS_DELTA 12
