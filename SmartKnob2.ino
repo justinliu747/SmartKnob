@@ -566,6 +566,8 @@ void calibrateAgc() {
 
 void setup() {
   Serial.begin(115200);
+  // USB CDC blocks up to 2 s per write when the PC isn't reading the port; drop output instead.
+  Serial.setTxTimeoutMs(0);
   delay(200);
   Serial.println();
   Serial.println("SmartKnob");
