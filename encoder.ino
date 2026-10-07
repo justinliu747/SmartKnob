@@ -4,8 +4,6 @@ static const uint16_t AS5048A_READ_ERRFL = 0x4001;
 static const SPISettings ENC_SPI_SETTINGS(4000000, MSBFIRST, SPI_MODE1);
 
 // AGC moves in steps of ~3 and slews ~3 counts per 10-20 ms; a grip while turning drops 3-6.
-#define AGC_PRESS_DELTA 12
-#define AGC_RELEASE_DELTA 6
 #define AGC_TRACK_BAND 3       // rest only follows readings within one AGC step
 #define AGC_DRIFT 0.005f
 #define AGC_MIN_HOLD_MS 80     // covers the click kick and flexure bounce
@@ -21,6 +19,8 @@ static uint8_t lastAgc = 0;
 static unsigned long lastAgcReadMs = 0;
 static unsigned long lastGoodMs = 0;
 static volatile bool encBtnDown = false;
+// Set live from the bridge over BLE. Release at half the press point keeps hysteresis (12 -> 6).
+static volatile uint8_t agcPressDelta = 12;
 static unsigned long pressStartMs = 0;
 static uint8_t agcSettle = 0;
 
@@ -121,16 +121,20 @@ static void encoderUpdatePress(unsigned long now) {
   }
 
   if (!encBtnDown) {
-    if (agcDrop >= AGC_PRESS_DELTA) {
+    if (agcDrop >= agcPressDelta) {
       encBtnDown = true;
       pressStartMs = now;
       clickHapticPending = true;
     } else if (fabsf(agcDrop) <= AGC_TRACK_BAND) {
       agcRest -= AGC_DRIFT * agcDrop;
     }
-  } else if (agcDrop <= AGC_RELEASE_DELTA && (now - pressStartMs) >= AGC_MIN_HOLD_MS) {
+  } else if (agcDrop <= agcPressDelta / 2 && (now - pressStartMs) >= AGC_MIN_HOLD_MS) {
     encBtnDown = false;
   }
+}
+
+void encoderSetPressDelta(uint8_t d) {
+  agcPressDelta = _constrain(d, 3, 60);
 }
 
 bool encoderPressDown() {
@@ -172,6 +176,15 @@ void encoderPrintAgc() {
                 lastAgc, agcRest, agcDrop, agcPeakDrop, encBtnDown ? 1 : 0,
                 (unsigned)motor.loopfoc_time_us);
   agcPeakDrop = agcDrop;
+}
+
+// [drop*4 as int8, down, press delta, release delta]
+void encoderPressPacket(uint8_t* p) {
+  float q = _constrain(agcDrop * 4.0f, -128.0f, 127.0f);
+  p[0] = (uint8_t)(int8_t)lroundf(q);
+  p[1] = encBtnDown ? 1 : 0;
+  p[2] = agcPressDelta;
+  p[3] = agcPressDelta / 2;
 }
 
 void encoderInit() {
@@ -217,21 +230,23 @@ float encoderGetAngle() {
   if (now - lastAgcReadMs >= AGC_READ_MS) {
     lastAgcReadMs = now;
     encFlags |= ENC_FLAG_AGC_READ;
-    if (encoderReadAgc() && agcReady) {
-      encoderUpdatePress(now);
-      if (agcLogOn) {
-        uint16_t next = (agcLogHead + 1) % AGC_LOG_SIZE;
-        if (next != agcLogTail) {
-          AgcLogEntry& e = agcLog[agcLogHead];
-          e.tMs = now;
-          e.raw = angle;
-          e.agc = lastAgc;
-          e.down = encBtnDown ? 1 : 0;
-          e.kick = clickRunning ? 1 : 0;
-          e.screen = (uint8_t)uiScreen;
-          e.uqMv = (int16_t)(motor.voltage.q * 1000.0f);
-          e.rest = agcRest;
-          agcLogHead = next;
+    if (encoderReadAgc()) {
+      if (agcReady) {
+        encoderUpdatePress(now);
+        if (agcLogOn) {
+          uint16_t next = (agcLogHead + 1) % AGC_LOG_SIZE;
+          if (next != agcLogTail) {
+            AgcLogEntry& e = agcLog[agcLogHead];
+            e.tMs = now;
+            e.raw = angle;
+            e.agc = lastAgc;
+            e.down = encBtnDown ? 1 : 0;
+            e.kick = clickRunning ? 1 : 0;
+            e.screen = (uint8_t)uiScreen;
+            e.uqMv = (int16_t)(motor.voltage.q * 1000.0f);
+            e.rest = agcRest;
+            agcLogHead = next;
+          }
         }
       }
     }

@@ -14,11 +14,27 @@ SERVICE_UUID = "cba1d411-0e8f-4e5c-8a21-6f3c9b01a001"
 STATUS_UUID = "cba1d411-0e8f-4e5c-8a21-6f3c9b01a002"
 VOLUME_UUID = "cba1d411-0e8f-4e5c-8a21-6f3c9b01a003"
 TRIGGER_UUID = "cba1d411-0e8f-4e5c-8a21-6f3c9b01a004"
+PRESS_UUID = "cba1d411-0e8f-4e5c-8a21-6f3c9b01a005"
 
 SCREEN_NAMES = {0: "Menu", 1: "Volume", 2: "Focus", 3: "Davinci"}
 SCREEN_VOLUME = 1
 SCREEN_DAVINCI = 3
 ENV_PATH = Path(__file__).resolve().parent / ".env"
+SETTINGS_PATH = Path(__file__).resolve().parent / "knob_settings.json"
+# AGC moves in steps of 3; gripping while turning drops it 3-6, so below 9 risks false presses.
+PRESS_DEFAULT = 12
+PRESS_MIN = 3
+PRESS_MAX = 30
+PRESS_STEP = 3
+PRESS_SAFE_MIN = 9
+BAR_FULL = 45  # depth shown at the top of the bar; firm presses reach ~45
+
+BG = "#1c1c1c"
+TRACK = "#2d2d2d"
+ACCENT = "#57c8ff"
+PRESSED = "#4cc38a"
+WARN = "#f5a524"
+MUTED = "#9a9a9a"
 FOCUS_ON_SUBJECT = "focus trigger"
 FOCUS_OFF_SUBJECT = "focus off"
 FOCUS_BODY = "sent from smartknob"
@@ -413,12 +429,14 @@ if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--resolve-jo
 
 import asyncio
 import ctypes
+import json
 import smtplib
 import threading
 import tkinter as tk
 from email.message import EmailMessage
 from tkinter import ttk
 
+import sv_ttk
 from bleak import BleakClient, BleakScanner
 from pycaw.pycaw import AudioUtilities
 
@@ -440,6 +458,22 @@ def load_env(path):
         key, _, value = line.partition("=")
         values[key.strip()] = value.strip().strip('"').strip("'")
     return values
+
+
+def load_settings():
+    try:
+        return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_settings(values):
+    SETTINGS_PATH.write_text(json.dumps(values), encoding="utf-8")
+
+
+def snap_press(value):
+    v = int(round(float(value) / PRESS_STEP)) * PRESS_STEP
+    return max(PRESS_MIN, min(PRESS_MAX, v))
 
 
 def send_play_pause():
@@ -471,8 +505,8 @@ class KnobApp:
     def __init__(self, root):
         self.root = root
         self.root.title("SmartKnob")
-        self.root.geometry("520x440")
-        self.root.resizable(True, True)
+        self.root.geometry("600x400")
+        self.root.minsize(560, 380)
 
         self.connected = False
         self.client = None
@@ -488,40 +522,84 @@ class KnobApp:
         self.step_pending = 0
         self.step_busy = False
         self.step_lock = threading.Lock()
+        self.press_delta = snap_press(load_settings().get("press_delta", PRESS_DEFAULT))
+        self.last_drop = 0.0
+        self.last_down = False
 
         self.status_var = tk.StringVar(value="Disconnected")
-        self.mode_var = tk.StringVar(value="—")
-        self.detent_var = tk.StringVar(value="—")
+        self.screen_var = tk.StringVar(value="—")
         self.volume_var = tk.StringVar(value="—")
         self.volume_pct = tk.IntVar(value=0)
         self.email_var = tk.StringVar(value="—")
         self.resolve_var = tk.StringVar(value="—")
+        self.press_var = tk.StringVar()
+        self.press_value_var = tk.StringVar()
+        self.press_warn_var = tk.StringVar()
+        self.press_scale_var = tk.DoubleVar(value=self.press_delta)
 
-        pad = {"padx": 12, "pady": 4}
-        ttk.Label(root, text="Connection").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Label(root, textvariable=self.status_var).grid(row=0, column=1, sticky="w", **pad)
-        ttk.Label(root, text="Screen").grid(row=1, column=0, sticky="w", **pad)
-        ttk.Label(root, textvariable=self.mode_var).grid(row=1, column=1, sticky="w", **pad)
-        ttk.Label(root, text="Detent").grid(row=2, column=0, sticky="w", **pad)
-        ttk.Label(root, textvariable=self.detent_var).grid(row=2, column=1, sticky="w", **pad)
-        ttk.Label(root, text="Volume").grid(row=3, column=0, sticky="w", **pad)
-        ttk.Label(root, textvariable=self.volume_var).grid(row=3, column=1, sticky="w", **pad)
-        ttk.Progressbar(root, maximum=100, variable=self.volume_pct, length=220).grid(
-            row=4, column=0, columnspan=2, padx=12, pady=12, sticky="ew"
-        )
-        ttk.Label(root, text="Email").grid(row=5, column=0, sticky="w", **pad)
-        ttk.Label(root, textvariable=self.email_var).grid(row=5, column=1, sticky="w", **pad)
-        ttk.Label(root, text="Resolve").grid(row=6, column=0, sticky="w", **pad)
-        ttk.Label(root, textvariable=self.resolve_var).grid(row=6, column=1, sticky="w", **pad)
-        ttk.Button(root, text="Reconnect", command=self.ask_reconnect).grid(
-            row=7, column=0, columnspan=2, pady=8
-        )
-        ttk.Label(root, text="BLE devices seen").grid(row=8, column=0, columnspan=2, sticky="w", **pad)
-        self.scan_list = tk.Listbox(root, height=8, font=("Consolas", 9))
-        self.scan_list.grid(row=9, column=0, columnspan=2, padx=12, pady=(0, 12), sticky="nsew")
-        root.grid_rowconfigure(9, weight=1)
-        root.grid_columnconfigure(1, weight=1)
+        main = ttk.Frame(root, padding=20)
+        main.pack(fill="both", expand=True)
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(1, weight=1)
 
+        header = ttk.Frame(main)
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 16))
+        ttk.Label(header, text="SmartKnob", font=("Segoe UI Semibold", 20)).pack(side="left")
+        ttk.Button(header, text="Reconnect", command=self.ask_reconnect).pack(side="right")
+        ttk.Label(header, textvariable=self.status_var, foreground=MUTED).pack(
+            side="right", padx=12
+        )
+
+        status = ttk.LabelFrame(main, text="Status", padding=16)
+        status.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
+        status.columnconfigure(1, weight=1)
+        rows = (
+            ("Screen", self.screen_var),
+            ("Volume", self.volume_var),
+            ("Email", self.email_var),
+            ("Resolve", self.resolve_var),
+        )
+        for i, (name, var) in enumerate(rows):
+            ttk.Label(status, text=name, foreground=MUTED).grid(
+                row=i * 2, column=0, sticky="w", pady=(0 if i == 0 else 10, 0)
+            )
+            ttk.Label(status, textvariable=var, font=("Segoe UI", 12)).grid(
+                row=i * 2, column=1, sticky="w", padx=(16, 0), pady=(0 if i == 0 else 10, 0)
+            )
+            if name == "Volume":
+                ttk.Progressbar(status, maximum=100, variable=self.volume_pct).grid(
+                    row=i * 2 + 1, column=0, columnspan=2, sticky="ew", pady=(6, 0)
+                )
+
+        press = ttk.LabelFrame(main, text="Push button", padding=16)
+        press.grid(row=1, column=1, sticky="ns")
+        self.press_canvas = tk.Canvas(press, width=180, height=150, bg=BG, highlightthickness=0)
+        self.press_canvas.grid(row=0, column=0, columnspan=2)
+        self.press_canvas.create_rectangle(70, 10, 110, 140, fill=TRACK, width=0)
+        self.press_fill = self.press_canvas.create_rectangle(70, 140, 110, 140, fill=ACCENT, width=0)
+        self.press_line = self.press_canvas.create_line(60, 0, 120, 0, fill=WARN, width=2)
+        self.release_line = self.press_canvas.create_line(
+            60, 0, 120, 0, fill=MUTED, dash=(4, 2)
+        )
+        self.press_canvas.create_text(124, 0, anchor="w", fill=WARN, text="press", tags="press_tag")
+        ttk.Label(press, textvariable=self.press_var, foreground=MUTED).grid(
+            row=1, column=0, columnspan=2, pady=(4, 12)
+        )
+        ttk.Label(press, text="Press point").grid(row=2, column=0, sticky="w")
+        ttk.Label(press, textvariable=self.press_value_var).grid(row=2, column=1, sticky="e")
+        ttk.Scale(
+            press,
+            from_=PRESS_MIN,
+            to=PRESS_MAX,
+            orient="horizontal",
+            variable=self.press_scale_var,
+            command=self.on_press_slider,
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Label(
+            press, textvariable=self.press_warn_var, foreground=WARN, wraplength=180
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        self.show_press_point()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.poll_windows_volume()
 
@@ -537,20 +615,49 @@ class KnobApp:
     def set_resolve_status(self, text):
         self.ui(lambda: self.resolve_var.set(text))
 
-    def apply_status_packet(self, screen, detent, value):
-        def update():
-            self.mode_var.set(SCREEN_NAMES.get(screen, "?"))
-            if screen == SCREEN_VOLUME:
-                self.detent_var.set(str(detent))
-                self.volume_var.set(f"{value}%")
-                self.volume_pct.set(value)
-            elif screen == SCREEN_DAVINCI:
-                self.detent_var.set(str(detent))
-            else:
-                self.detent_var.set("—")
+    def draw_press(self):
+        top, bottom = 10, 140
 
-        self.ui(update)
+        def y_for(value):
+            frac = min(max(value / BAR_FULL, 0.0), 1.0)
+            return bottom - frac * (bottom - top)
+
+        c = self.press_canvas
+        press_y = y_for(self.press_delta)
+        release_y = y_for(self.press_delta // 2)
+        c.coords(self.press_fill, 70, y_for(self.last_drop), 110, bottom)
+        c.itemconfig(self.press_fill, fill=PRESSED if self.last_down else ACCENT)
+        c.coords(self.press_line, 60, press_y, 120, press_y)
+        c.coords(self.release_line, 60, release_y, 120, release_y)
+        c.coords("press_tag", 124, press_y)
+        state = "pressed" if self.last_down else "released"
+        self.press_var.set(f"depth {self.last_drop:.1f}  ·  {state}")
+
+    def show_press_point(self):
+        v = self.press_delta
+        self.press_value_var.set(f"{v}  ({v // PRESS_STEP} steps)")
+        if v < PRESS_SAFE_MIN:
+            self.press_warn_var.set(
+                f"Below {PRESS_SAFE_MIN}: a firm grip while turning can count as a press."
+            )
+        else:
+            self.press_warn_var.set("")
+        self.draw_press()
+
+    def on_press_slider(self, value):
+        v = snap_press(value)
+        self.press_scale_var.set(v)
+        if v == self.press_delta:
+            return
+        self.press_delta = v
+        self.show_press_point()
+        save_settings({"press_delta": v})
+        if self.connected and self.loop is not None:
+            asyncio.run_coroutine_threadsafe(self.write_press(v), self.loop)
+
+    def apply_status_packet(self, screen, detent, value):
         self.knob_screen = screen
+        self.ui(lambda: self.screen_var.set(SCREEN_NAMES.get(screen, "?")))
 
         if screen == SCREEN_VOLUME:
             self.resolve_armed = False
@@ -685,10 +792,26 @@ class KnobApp:
             return
         await self.client.write_gatt_char(VOLUME_UUID, bytes([percent]), response=False)
 
+    async def write_press(self, delta):
+        if self.client is None or not self.client.is_connected:
+            return
+        try:
+            await self.client.write_gatt_char(PRESS_UUID, bytes([delta]), response=False)
+            log(f"BLE: press point {delta}")
+        except Exception as exc:
+            log(f"BLE: press point write failed: {exc}")
+
     async def on_status(self, _sender, data):
         if len(data) < 4:
             return
         self.apply_status_packet(data[0], data[1], data[2])
+
+    async def on_press(self, _sender, data):
+        if len(data) < 4:
+            return
+        self.last_drop = int.from_bytes(data[0:1], "little", signed=True) / 4.0
+        self.last_down = data[1] != 0
+        self.ui(self.draw_press)
 
     async def on_trigger(self, _sender, data):
         kind = data[0] if data else TRIGGER_ON
@@ -712,30 +835,14 @@ class KnobApp:
             log(f"Email: failed: {exc}")
             self.set_email_status(f"Failed: {exc}")
 
-    def show_scan_results(self, lines):
-        def update():
-            self.scan_list.delete(0, tk.END)
-            if not lines:
-                self.scan_list.insert(tk.END, "(no BLE advertisements this scan)")
-            else:
-                for line in lines:
-                    self.scan_list.insert(tk.END, line)
-
-        self.ui(update)
-
     async def find_knob(self):
         discovered = await BleakScanner.discover(timeout=8.0, return_adv=True)
         match = None
-        lines = []
-        for address, (device, adv) in discovered.items():
-            name = device.name or adv.local_name or "?"
+        for device, adv in discovered.values():
             uuids = [u.lower() for u in (adv.service_uuids or [])]
-            line = f"{name}  {address}  uuids={len(uuids)}"
-            lines.append(line)
             names = {device.name, adv.local_name}
             if DEVICE_NAME in names or SERVICE_UUID.lower() in uuids:
                 match = device
-        self.show_scan_results(lines)
         return match, len(discovered)
 
     async def connect_loop(self):
@@ -763,6 +870,11 @@ class KnobApp:
                     except Exception as exc:
                         log(f"Email: trigger subscribe failed: {exc}")
                         self.set_email_status(f"Trigger unavailable: {exc}")
+                    try:
+                        await client.start_notify(PRESS_UUID, self.on_press)
+                    except Exception as exc:
+                        log(f"BLE: press subscribe failed: {exc}")
+                    await self.write_press(self.press_delta)
                     percent = int(round(self.endpoint.GetMasterVolumeLevelScalar() * 100))
                     self.echo_percent = percent
                     await self.write_percent(percent)
@@ -802,6 +914,7 @@ class KnobApp:
 def main():
     log(f"Bridge: start Python {sys.version.split()[0]}")
     root = tk.Tk()
+    sv_ttk.set_theme("dark")
     app = KnobApp(root)
     app.start_ble_thread()
     root.mainloop()

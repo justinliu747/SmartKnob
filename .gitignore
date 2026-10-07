@@ -6,6 +6,7 @@ venv/
 .env
 .env.*
 logs/
+knob_settings.json
 
 # Local notes and Cursor rules
 notes.md

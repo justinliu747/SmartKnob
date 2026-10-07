@@ -28,6 +28,16 @@ void notifyStatus() {
   statusChar->notify();
 }
 
+void notifyPress() {
+  if (pressChar == nullptr || !bleConnected) {
+    return;
+  }
+  uint8_t packet[4];
+  encoderPressPacket(packet);
+  pressChar->setValue(packet, 4);
+  pressChar->notify();
+}
+
 void applyVolumeRemap(uint8_t percent) {
   if (percent > 100) {
     percent = 100;
@@ -86,8 +96,18 @@ class VolumeCallbacks : public NimBLECharacteristicCallbacks {
   }
 };
 
+class PressCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
+    NimBLEAttValue value = pChar->getValue();
+    if (value.size() >= 1) {
+      encoderSetPressDelta(value.data()[0]);
+    }
+  }
+};
+
 ServerCallbacks serverCallbacks;
 VolumeCallbacks volumeCallbacks;
+PressCallbacks pressCallbacks;
 
 void startKnobAdvertising() {
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
@@ -126,6 +146,12 @@ void startBle() {
     SK_TRIGGER_UUID,
     NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
   );
+
+  pressChar = service->createCharacteristic(
+    SK_PRESS_UUID,
+    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
+  );
+  pressChar->setCallbacks(&pressCallbacks);
 
   service->start();
   startKnobAdvertising();

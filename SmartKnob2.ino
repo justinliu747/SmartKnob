@@ -19,6 +19,7 @@ SPIClass encoderSPI(FSPI);
 #define SK_STATUS_UUID   "cba1d411-0e8f-4e5c-8a21-6f3c9b01a002"
 #define SK_VOLUME_UUID   "cba1d411-0e8f-4e5c-8a21-6f3c9b01a003"
 #define SK_TRIGGER_UUID  "cba1d411-0e8f-4e5c-8a21-6f3c9b01a004"
+#define SK_PRESS_UUID    "cba1d411-0e8f-4e5c-8a21-6f3c9b01a005"
 
 #define TRIGGER_FOCUS_ON  1
 #define TRIGGER_FOCUS_OFF 2
@@ -71,10 +72,13 @@ float encoderGetAngle();
 void encoderInit();
 bool encoderPressDown();
 void encoderStartPress();
+void encoderSetPressDelta(uint8_t d);
 void encoderPrintAgc();
+void encoderPressPacket(uint8_t* p);
 uint16_t encoderRawAngle();
 uint8_t encoderTakeFlags();
 void encoderDrainLog();
+void notifyPress();
 void startBle();
 void applyVolumeRemap(uint8_t percent);
 void notifyFocusTrigger(uint8_t value);
@@ -143,6 +147,7 @@ unsigned long clickQuietUntil = 0;
 
 bool agcDebug = false;
 unsigned long lastAgcPrintMs = 0;
+unsigned long lastPressNotifyMs = 0;
 
 // Debug logging: 'r' rumble snapshot, 'l' AGC stream, 'z' motor torque off.
 #define RUMBLE_SAMPLES 4000
@@ -168,6 +173,7 @@ volatile bool torqueOff = false;
 
 NimBLECharacteristic* statusChar = nullptr;
 NimBLECharacteristic* triggerChar = nullptr;
+NimBLECharacteristic* pressChar = nullptr;
 NimBLEServer* knobServer = nullptr;
 
 const char* resetReasonText(esp_reset_reason_t reason) {
@@ -579,6 +585,11 @@ void uiTask(void* pv) {
     if (agcDebug && millis() - lastAgcPrintMs >= 50) {
       lastAgcPrintMs = millis();
       encoderPrintAgc();
+    }
+
+    if (bleConnected && millis() - lastPressNotifyMs >= 40) {
+      lastPressNotifyMs = millis();
+      notifyPress();
     }
 
     handleButton(pollButton());
