@@ -13,25 +13,19 @@ void notifyStatus() {
   if (statusChar == nullptr || !bleConnected) {
     return;
   }
-  if (uiScreen != SCREEN_VOLUME && uiScreen != SCREEN_DAVINCI) {
-    return;
-  }
-  uint8_t packet[4];
-  packet[0] = (uint8_t)profile;
+  // [screen, detent, percent or trim, numDetents]; Menu and Focus only report the screen.
+  uint8_t packet[4] = {(uint8_t)uiScreen, 0, 0, 0};
   if (uiScreen == SCREEN_DAVINCI) {
     packet[1] = (uint8_t)lastDetent;
     packet[2] = davinciTrim ? 1 : 0;
-    packet[3] = 0;
-  } else {
+  } else if (uiScreen == SCREEN_VOLUME) {
     int level = detentLevel();
     packet[1] = (uint8_t)level;
     packet[2] = percentFromLevel(level);
     packet[3] = (uint8_t)numDetents;
-    lastNotifiedDetent = level;
   }
   statusChar->setValue(packet, 4);
   statusChar->notify();
-  lastNotifiedMode = profile;
 }
 
 void applyVolumeRemap(uint8_t percent) {

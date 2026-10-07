@@ -15,7 +15,9 @@ STATUS_UUID = "cba1d411-0e8f-4e5c-8a21-6f3c9b01a002"
 VOLUME_UUID = "cba1d411-0e8f-4e5c-8a21-6f3c9b01a003"
 TRIGGER_UUID = "cba1d411-0e8f-4e5c-8a21-6f3c9b01a004"
 
-MODE_NAMES = {1: "Spring", 2: "Detent", 3: "Switch", 4: "Davinci"}
+SCREEN_NAMES = {0: "Menu", 1: "Volume", 2: "Focus", 3: "Davinci"}
+SCREEN_VOLUME = 1
+SCREEN_DAVINCI = 3
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 FOCUS_ON_SUBJECT = "focus trigger"
 FOCUS_OFF_SUBJECT = "focus off"
@@ -478,7 +480,7 @@ class KnobApp:
         self.echo_percent = None
         self.ignore_poll_until = 0.0
         self.endpoint = windows_volume()
-        self.knob_mode = None
+        self.knob_screen = None
         self.resolve_armed = False
         self.resolve_last_detent = None
         self.davinci_trim = False
@@ -498,7 +500,7 @@ class KnobApp:
         pad = {"padx": 12, "pady": 4}
         ttk.Label(root, text="Connection").grid(row=0, column=0, sticky="w", **pad)
         ttk.Label(root, textvariable=self.status_var).grid(row=0, column=1, sticky="w", **pad)
-        ttk.Label(root, text="Mode").grid(row=1, column=0, sticky="w", **pad)
+        ttk.Label(root, text="Screen").grid(row=1, column=0, sticky="w", **pad)
         ttk.Label(root, textvariable=self.mode_var).grid(row=1, column=1, sticky="w", **pad)
         ttk.Label(root, text="Detent").grid(row=2, column=0, sticky="w", **pad)
         ttk.Label(root, textvariable=self.detent_var).grid(row=2, column=1, sticky="w", **pad)
@@ -535,28 +537,30 @@ class KnobApp:
     def set_resolve_status(self, text):
         self.ui(lambda: self.resolve_var.set(text))
 
-    def apply_status_packet(self, mode, detent, percent, num_detents, from_knob):
+    def apply_status_packet(self, screen, detent, value):
         def update():
-            self.mode_var.set(f"{mode} ({MODE_NAMES.get(mode, '?')})")
-            self.detent_var.set(f"{detent} / {num_detents}")
-            self.volume_var.set(f"{percent}%")
-            self.volume_pct.set(percent)
+            self.mode_var.set(SCREEN_NAMES.get(screen, "?"))
+            if screen == SCREEN_VOLUME:
+                self.detent_var.set(str(detent))
+                self.volume_var.set(f"{value}%")
+                self.volume_pct.set(value)
+            elif screen == SCREEN_DAVINCI:
+                self.detent_var.set(str(detent))
+            else:
+                self.detent_var.set("—")
 
         self.ui(update)
-        self.knob_mode = mode
+        self.knob_screen = screen
 
-        if not from_knob:
-            return
-
-        if mode == 2:
+        if screen == SCREEN_VOLUME:
             self.resolve_armed = False
-            self.echo_percent = percent
+            self.echo_percent = value
             self.ignore_poll_until = time.monotonic() + 0.4
-            self.endpoint.SetMasterVolumeLevelScalar(percent / 100.0, None)
+            self.endpoint.SetMasterVolumeLevelScalar(value / 100.0, None)
             return
 
-        if mode == 4:
-            trim = percent != 0
+        if screen == SCREEN_DAVINCI:
+            trim = value != 0
             log(f"BLE: davinci detent={detent} trim={int(trim)}")
             detent_copy = detent
             trim_copy = trim
@@ -684,8 +688,7 @@ class KnobApp:
     async def on_status(self, _sender, data):
         if len(data) < 4:
             return
-        mode, detent, percent, num_detents = data[0], data[1], data[2], data[3]
-        self.apply_status_packet(mode, detent, percent, num_detents, from_knob=True)
+        self.apply_status_packet(data[0], data[1], data[2])
 
     async def on_trigger(self, _sender, data):
         kind = data[0] if data else TRIGGER_ON

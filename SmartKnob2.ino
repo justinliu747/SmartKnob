@@ -99,8 +99,6 @@ int numDetents = 100;
 float detentSize = 2.0f * PI / (float)numDetents;
 float closestDetent = 0.0f;
 
-int profile = 2;
-
 float userTorque = 0.0f;
 
 int lastDetent = 0;
@@ -108,8 +106,6 @@ bool detentInitialized = false;
 bool wrapDetents = true;
 bool bleConnected = false;
 bool bleWasConnected = false;
-int lastNotifiedMode = -1;
-int lastNotifiedDetent = -1;
 
 volatile bool remapPending = false;
 volatile uint8_t remapPercent = 0;
@@ -242,22 +238,20 @@ unsigned long focusRemainingMs() {
 
 void enterMenu() {
   uiScreen = SCREEN_MENU;
-  profile = 2;
   davinciTrim = false;
   uiDirty = true;
   hapticPending = HAPTIC_MENU;
+  statusNotifyPending = true;
 }
 
 void enterVolume() {
   uiScreen = SCREEN_VOLUME;
-  profile = 2;
   uiDirty = true;
   hapticPending = HAPTIC_VOLUME;
 }
 
 void enterDavinci() {
   uiScreen = SCREEN_DAVINCI;
-  profile = 4;
   davinciTrim = false;
   uiDirty = true;
   hapticPending = HAPTIC_DAVINCI;
@@ -266,14 +260,13 @@ void enterDavinci() {
 void enterFocus() {
   uiScreen = SCREEN_FOCUS;
   if (focusPhase == FOCUS_RUNNING) {
-    profile = 1;
     lastDrawnFocusSec = -1;
     hapticPending = HAPTIC_SPRING;
   } else {
-    profile = 2;
     hapticPending = HAPTIC_FOCUS_CONFIG;
   }
   uiDirty = true;
+  statusNotifyPending = true;
 }
 
 void startFocusSession() {
@@ -297,7 +290,6 @@ void endFocusSession() {
   focusPhase = FOCUS_DONE;
   notifyFocusTrigger(TRIGGER_FOCUS_OFF);
   if (uiScreen == SCREEN_FOCUS) {
-    profile = 1;
     hapticPending = HAPTIC_SPRING;
   }
   uiDirty = true;
@@ -489,15 +481,6 @@ void runDetents(bool wrap) {
   }
 }
 
-void runSwitch() {
-  float angleToDetent = 0.0f - currentAngle;
-  if (currentAngle >= PI / 4.0f) {
-    angleToDetent = PI / 2.0f - currentAngle;
-  }
-  float dampVel = knobVel - _constrain(knobVel, -DAMP_DEADBAND, DAMP_DEADBAND);
-  userTorque = _constrain(7.0f * angleToDetent, -SPRING_LIMIT, SPRING_LIMIT) - 0.03f * dampVel;
-}
-
 void uiTask(void* pv) {
   for (;;) {
     if (triggerPending) {
@@ -507,7 +490,7 @@ void uiTask(void* pv) {
 
     if (bleConnected != bleWasConnected) {
       bleWasConnected = bleConnected;
-      if (bleConnected && (uiScreen == SCREEN_VOLUME || uiScreen == SCREEN_DAVINCI)) {
+      if (bleConnected) {
         statusNotifyPending = true;
       }
     }
@@ -519,9 +502,6 @@ void uiTask(void* pv) {
 
     if (Serial.available() > 0) {
       char inChar = Serial.read();
-      if (inChar == '1') profile = 1;
-      if (inChar == '2') profile = 2;
-      if (inChar == '3') profile = 3;
       if (inChar == 's' || inChar == 'S') {
         triggerValue = TRIGGER_FOCUS_ON;
         triggerPending = true;
@@ -644,8 +624,6 @@ void loop() {
     runDetents(false);
   } else if (uiScreen == SCREEN_FOCUS && focusPhase == FOCUS_IDLE) {
     runDetents(false);
-  } else if (profile == 3) {
-    runSwitch();
   } else {
     runSpring();
   }
